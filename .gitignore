@@ -97,7 +97,6 @@ models/
 # ── Secrets/Config ──
 .env
 .env.local
-db_config.py
 
 # ── Backup Files ──
 *_mbak_*.json

@@ -66,6 +66,8 @@ def load_manifest():
         try:
             data = safe_json_load(MANIFEST_FILE)
             if isinstance(data, dict) and "files" in data and isinstance(data["files"], dict):
+                from common_utils import filter_manifest_files_by_env
+                data["files"] = filter_manifest_files_by_env(data["files"])
                 return data
         except Exception:
             pass
@@ -202,9 +204,19 @@ def get_pending_files_from_local():
     if not os.path.exists(PDF_DIR):
         raise Exception(f"PDF_DIR 不存在: {PDF_DIR}")
 
+    from common_utils import is_manifest_filtered
+    _filtered = is_manifest_filtered()
+    if _filtered:
+        manifest = load_manifest()
+        manifest_files = set(manifest.get("files", {}).keys())
+
     pending = []
     for fn in os.listdir(PDF_DIR):
         if not fn.lower().endswith('.pdf'):
+            continue
+
+        # Whitelist mode: 跳过不在过滤后 manifest 中的文件
+        if _filtered and fn not in manifest_files:
             continue
 
         parsed = _parse_pdf_filename(fn)

@@ -4,8 +4,15 @@
 pipeline_controller.py — RunConductor: 端到端管道编排器
 
 用法:
-  python pipeline_controller.py <BATCH>            # 全新运行
-  python pipeline_controller.py <BATCH> --resume   # 从崩溃恢复
+  python pipeline_controller.py <BATCH>                   # 批次模式（BATCH_CONFIG.json）
+  python pipeline_controller.py --codes 508066,508028      # 指定 code 列表模式
+  python pipeline_controller.py --codes 508066 --resume    # 续跑
+  python pipeline_controller.py --doc 2022-05-06           # 单文档匹配模式
+
+模式对比:
+  批次模式: BATCH_CONFIG.json 定义的 batch → step5 带 GATE1 → step8.1 后 GATE2
+  --codes:  逗号分隔的 code 列表 → step5 无 GATE1（控制器自动标记 merge_done）→ GATE2
+  --doc:    从 manifest 中匹配文件名子串 → 同上非批模式
 """
 
 import datetime
@@ -183,15 +190,22 @@ def _find_start_index(doc_statuses: list) -> int:
     return len(STEP_SEQUENCE)
 
 
-def _run_step(script: str, flag: str, desc: str, batch_name: str, current: int, total: int) -> bool:
-    """执行单个步骤，支持瞬时重试。返回 True 表示成功。"""
+def _run_step(script: str, flag: str, desc: str, batch_name: str, batch_codes: list, current: int, total: int, gate_mode: bool = True) -> bool:
+    """执行单个步骤，支持瞬时重试。返回 True 表示成功。
+
+    gate_mode=False 时，step5 不加 --gate 参数（非批模式合并后由控制器标记 merge_done）。
+    """
     script_path = os.path.join(SCRIPT_DIR, script)
     cmd = [CONDA_PYTHON, script_path]
 
-    # step5 需要 --gate 参数
-    if script == "step5_merge_table_into_text.py":
+    # step5 GATE1：只有 batch 模式才传 --gate
+    if script == "step5_merge_table_into_text.py" and gate_mode:
         cmd.append("--gate")
         cmd.append(batch_name)
+
+    # 通过 CLI --batch-codes 参数传递给 step 脚本
+    if batch_codes:
+        cmd.extend(["--batch-codes", ",".join(batch_codes)])
 
     for attempt in range(1, RETRY_MAX + 1):
         print(f"\n  [{desc}] 执行中 (attempt {attempt}/{RETRY_MAX})...")
@@ -217,7 +231,98 @@ def _run_step(script: str, flag: str, desc: str, batch_name: str, current: int, 
     return False
 
 
-def _run_gate2(batch_name: str) -> bool:
+def _auto_mark_merge_done(batch_codes: list):
+    """非批模式下，step5 合并后由控制器直接标记 merge_done。"""
+    from common_utils import safe_json_dump, safe_json_load
+    output_dir = os.path.join(SCRIPT_DIR, "announcement_document_processing_local")
+    manifest = safe_read_json(MANIFEST_PATH) or {}
+    files_map = manifest.get("files", {}) or {}
+    marked = 0
+    for file_name, info in files_map.items():
+        fund_code = (info or {}).get("fund_code", "")
+        if fund_code not in batch_codes:
+            continue
+        doc_dir = os.path.join(output_dir, fund_code, os.path.splitext(file_name)[0])
+        meta_path = os.path.join(doc_dir, "meta.json")
+        meta = safe_read_json(meta_path)
+        if not isinstance(meta, dict):
+            continue
+        # 前置条件检查：table_describe_done 和 not_table_describe_done 必须 True
+        if meta.get("table_describe_done") is not True or meta.get("not_table_describe_done") is not True:
+            continue
+        meta["merge_done"] = True
+        safe_json_dump(meta, meta_path)
+        # 清理 temp_pdf_images/
+        temp_dir = os.path.join(doc_dir, "temp_pdf_images")
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        marked += 1
+        print(f"  ✅ merge_done + 清图: {file_name}")
+    if marked:
+        print(f"  非批模式：已标记 {marked} 个文档 merge_done 并清理中间图片")
+
+
+def run_pipeline_with_codes(batch_codes: list, label: str = "adhoc", resume: bool = False):
+    """非批模式：直接指定 code 列表跑全流程。无 GATE1，step5 合并后自动标记 merge_done。"""
+    from common_utils import safe_json_dump, safe_json_load
+
+    batch_name = f"{label}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    print(f"RunConductor (adhoc): {label}  codes={batch_codes}\n")
+
+    # ── Pre-flight 检查 ──
+    if not run_preflight(batch_name, batch_codes):
+        print("❌ Pre-flight 失败，退出")
+        sys.exit(1)
+
+    # ── 扫描文档状态 ──
+    doc_statuses = _collect_doc_statuses(batch_codes)
+    total_docs = len(doc_statuses)
+    print(f"目标文档数: {total_docs}\n")
+
+    start_idx = _find_start_index(doc_statuses)
+
+    if start_idx > 0:
+        skipped = [STEP_SEQUENCE[i][2] for i in range(start_idx)]
+        print(f"已完成步骤: {skipped}")
+        print(f"从步骤 {start_idx} 开始 ({STEP_SEQUENCE[start_idx][2]})\n")
+
+    # ── 逐步执行 ──
+    for i in range(start_idx, len(STEP_SEQUENCE)):
+        script, flag, desc = STEP_SEQUENCE[i]
+
+        if _step_completed(doc_statuses, flag):
+            print(f"[{desc}] ✅ 已完成，跳过")
+            continue
+
+        print(f"\n{'=' * 50}")
+        print(f"  步骤 {i + 1}/{len(STEP_SEQUENCE)}: {desc}")
+        print(f"{'=' * 50}")
+
+        success = _run_step(script, flag, desc, batch_name, batch_codes, i, len(STEP_SEQUENCE), gate_mode=False)
+        if not success:
+            print(f"\n❌ [{desc}] 永久失败，管道中断")
+            sys.exit(1)
+
+        # step5 后：自动标记 merge_done（无 GATE1 模式）
+        if script == "step5_merge_table_into_text.py":
+            print(f"\n  [非批模式] step5 完成，自动标记 merge_done + 清图...")
+            _auto_mark_merge_done(batch_codes)
+
+        # step8_1 后 run GATE2
+        if script == "step8_1_ingest_elasticsearch_data.py":
+            gate2_ok = _run_gate2(batch_name)
+            if not gate2_ok:
+                print(f"\n❌ GATE2 精度检查失败")
+                sys.exit(1)
+
+        doc_statuses = _collect_doc_statuses(batch_codes)
+
+    print(f"\n{'=' * 60}")
+    print(f"  RunConductor: {label} 全部完成 ✅")
+    print(f"{'=' * 60}")
+    print(f"  步骤总数: {len(STEP_SEQUENCE)}")
+    print(f"  文档总数: {total_docs}")
+    print(f"{'=' * 60}\n")
     """运行 GATE2 精度检查。"""
     gate2_path = os.path.join(SCRIPT_DIR, "gate2_accuracy_check.py")
     if not os.path.exists(gate2_path):
@@ -321,7 +426,7 @@ def run_batch(batch_name: str, resume: bool = False):
         save_state(state)
 
         # 执行
-        success = _run_step(script, flag, desc, batch_name, i, len(STEP_SEQUENCE))
+        success = _run_step(script, flag, desc, batch_name, batch_codes, i, len(STEP_SEQUENCE))
         if not success:
             print(f"\n❌ [{desc}] 永久失败，管道中断")
             state["failed_step"] = desc
@@ -368,12 +473,47 @@ def run_batch(batch_name: str, resume: bool = False):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python pipeline_controller.py <BATCH> [--resume]")
-        print("示例: python pipeline_controller.py B2g")
-        print("      python pipeline_controller.py B2g --resume")
+        print("用法:")
+        print("  python pipeline_controller.py <BATCH>              # 批次模式")
+        print("  python pipeline_controller.py --codes 508066,508028  # 指定 code 列表")
+        print("  python pipeline_controller.py --codes 508066 --resume  # 续跑")
         print(f"\n可用 batch: {list(safe_read_json(BATCH_CONFIG_PATH).keys()) if safe_read_json(BATCH_CONFIG_PATH) else 'N/A'}")
         sys.exit(1)
 
-    batch = sys.argv[1]
     do_resume = "--resume" in sys.argv
-    run_batch(batch, resume=do_resume)
+
+    if sys.argv[1] == "--codes":
+        # 指定 code 列表模式
+        if len(sys.argv) < 3:
+            print("用法: python pipeline_controller.py --codes 508066,508028,180601")
+            sys.exit(1)
+        codes = [c.strip() for c in sys.argv[2].split(",") if c.strip()]
+        label = f"codes_{','.join(codes)}"
+        run_pipeline_with_codes(codes, label=label, resume=do_resume)
+
+    elif sys.argv[1] == "--doc":
+        # 单文档模式：从 manifest 中匹配包含指定子串的文档
+        if len(sys.argv) < 3:
+            print("用法: python pipeline_controller.py --doc <pattern>")
+            print("示例: python pipeline_controller.py --doc 2022-05-06")
+            sys.exit(1)
+        doc_pattern = sys.argv[2]
+        manifest = safe_read_json(MANIFEST_PATH) or {}
+        files_map = manifest.get("files", {}) or {}
+        matching_codes = set()
+        for fname, info in files_map.items():
+            if doc_pattern in fname:
+                code = (info or {}).get("fund_code", "")
+                if code:
+                    matching_codes.add(code)
+        if not matching_codes:
+            print(f"❌ 未找到匹配 '{doc_pattern}' 的文档")
+            sys.exit(1)
+        codes = sorted(matching_codes)
+        print(f"匹配文档: {doc_pattern} → codes={codes}")
+        run_pipeline_with_codes(codes, label=f"doc_{doc_pattern}", resume=do_resume)
+
+    else:
+        # 批次模式（原有逻辑）
+        batch = sys.argv[1]
+        run_batch(batch, resume=do_resume)

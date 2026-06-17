@@ -88,6 +88,7 @@ def _infer_status_from_files(pdf_folder_dir: str):
 def get_pending_files_from_local():
     manifest = _safe_read_json(MANIFEST_FILE) or {}
     files_map = manifest.get("files", {}) or {}
+    from common_utils import filter_manifest_files_by_env; files_map = filter_manifest_files_by_env(files_map)
     grouped_files = {}
 
     for file_name, base_info in files_map.items():

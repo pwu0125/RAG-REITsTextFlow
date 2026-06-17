@@ -90,6 +90,8 @@ def load_manifest():
         try:
             data = safe_json_load(MANIFEST_FILE)
             if isinstance(data, dict) and "files" in data and isinstance(data["files"], dict):
+                from common_utils import filter_manifest_files_by_env
+                data["files"] = filter_manifest_files_by_env(data["files"])
                 return data
         except Exception:
             pass
@@ -100,10 +102,10 @@ def load_manifest():
         "files": {}
     }
 
+
 def save_manifest(manifest):
     manifest["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     safe_json_dump(manifest, MANIFEST_FILE)
-
 # 单个 PDF 文件多线程处理
 def process_pdf(file):
     parsed = parse_pdf_filename(file)
@@ -148,27 +150,34 @@ def process_pdfs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     manifest = load_manifest()
-    processed_files = set(manifest.get("files", {}).keys())
+    manifest_files = set(manifest.get("files", {}).keys())
 
     if not os.path.exists(PDF_DIR):
         print(f"PDF目录不存在: {PDF_DIR}")
         logger.warning(f"PDF目录不存在: {PDF_DIR}")
         return
 
-    pdf_files = os.listdir(PDF_DIR)
-    total_pdf_files = len(pdf_files)
-
-    files_to_process = []
-    skipped_bad_name = 0
-    for file in pdf_files:
-        if not file.lower().endswith(".pdf"):
-            continue
-        if file in processed_files:
-            continue
-        if not parse_pdf_filename(file):
-            skipped_bad_name += 1
-            continue
-        files_to_process.append(file)
+    from common_utils import is_manifest_filtered
+    if is_manifest_filtered():
+        # Whitelist mode: 只处理过滤后的 manifest 中的文档
+        files_to_process = [f for f in manifest_files if f.lower().endswith(".pdf")]
+        total_pdf_files = len(manifest_files)
+        skipped_bad_name = 0
+    else:
+        # Default mode: 处理 raw/ 中尚未在 manifest 的文档
+        pdf_files = os.listdir(PDF_DIR)
+        total_pdf_files = len(pdf_files)
+        files_to_process = []
+        skipped_bad_name = 0
+        for file in pdf_files:
+            if not file.lower().endswith(".pdf"):
+                continue
+            if file in manifest_files:
+                continue
+            if not parse_pdf_filename(file):
+                skipped_bad_name += 1
+                continue
+            files_to_process.append(file)
 
     pending_count = len(files_to_process)
     results = []
