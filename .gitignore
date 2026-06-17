@@ -1,0 +1,141 @@
+# ═══════════════════════════════════════════════════════════
+# RAG-REITsTextFlow .gitignore
+# ═══════════════════════════════════════════════════════════
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ── Virtual Environment ──
+venv/
+ENV/
+env/
+.venv
+anaconda3/
+pkgs/
+conda-meta/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.claude/
+.hermes/
+
+# ── Data Directories (massive, not source code) ──
+announcement_document_processing_local/
+announcement_document_raw/
+debug_output/
+output/
+log/
+log_rescan/
+manifest_backups/
+page_images/
+extracted_text/
+downloaded_pdfs/
+processed_output/
+
+# ── Intermediate/Generated JSON ──
+*.json
+!BATCH_CONFIG.json
+!requirements-dev.json
+
+# ── Model Files ──
+table-transformer-detection/
+*.model
+*.pkl
+*.pickle
+models/
+*.safetensors
+*.bin
+*.h5
+*.onnx
+
+# ── Images ──
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.svg
+
+# ── PDFs ──
+*.pdf
+
+# ── Logs ──
+*.log
+
+# ── Database ──
+*.db
+*.sqlite3
+
+# ── Secrets/Config ──
+.env
+.env.local
+db_config.py
+
+# ── Backup Files ──
+*_mbak_*.json
+backup_*/
+*_backup/
+*.bak
+*.backup
+
+# ── Zips/Archives ──
+*.zip
+*.tar.gz
+*.tar
+
+# ── OS ──
+Thumbs.db
+
+# ── Test/Coverage ──
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ── Local Runner Scripts ──
+_*.py
+_*.sh
+cc_report.sh
+run_add_opdata.sh
+run_all_batches_step8_2.sh
+add_operational_data.py
+add_ops_to_manifest.py
+additions_opdata*.json
+diagnosis_*.json
+
+# ── Other ──
+tmp/
+temp/
+*.tmp
+*.swp
+extract_text_onlyvactor_log.txt
+ngrok
+.metaguard_status.json
+pipeline_state.json
