@@ -1,0 +1,528 @@
+                                                                                                                #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+step2_a_extract_text_onlyvactor_multi_process.py
+文本提取，多进程处理
+
+"""
+
+import os
+import regex as re
+import json
+import datetime
+import pdfplumber
+import fitz
+import numpy as np
+from PIL import Image
+import concurrent.futures  # 多进程
+import logging
+
+from file_paths_config import OUTPUT_DIR, PDF_DIR
+from common_utils import safe_json_dump, safe_json_load
+
+PAGE_CHAR_THRESHOLD = 5
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ========== 自定义JSON编码器 ===========
+class DateTimeEncoder(json.JSONEncoder):
+    """自定义JSON编码器，处理日期时间序列化"""
+    def default(self, obj):
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.strftime('%Y-%m-%d')
+        return super().default(obj)
+
+# ========== 日志配置 ===========
+# 创建日志目录，使用相对路径
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, "log")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILENAME = os.path.join(LOG_DIR, "extract_text_onlyvactor.log")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+fh = logging.FileHandler(LOG_FILENAME, mode='a', encoding='utf-8')
+fh.setLevel(logging.WARNING)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+
+MANIFEST_FILE = os.path.join(OUTPUT_DIR, "processed_files_local.json")
+
+DEFAULT_STATUS = {
+    "text_extracted": False,
+    "table_detection_vector_done": False,
+    "table_detection_scan_done": False,
+    "table_describe_done": False,
+    "not_table_describe_done": False,
+    "merge_done": False,
+    "text_segmentation": False,
+    "embedding_done": False,
+    "vector_database_done": False,
+    "elasticsearch_database_done": False,
+}
+
+
+def load_manifest():
+    if os.path.exists(MANIFEST_FILE):
+        try:
+            data = safe_json_load(MANIFEST_FILE)
+            if isinstance(data, dict) and "files" in data and isinstance(data["files"], dict):
+                return data
+        except Exception:
+            pass
+    return {
+        "generated_at": "",
+        "source_dir": PDF_DIR,
+        "output_dir": OUTPUT_DIR,
+        "files": {}
+    }
+
+
+def save_manifest(manifest):
+    manifest["generated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_json_dump(manifest, MANIFEST_FILE)
+
+
+def _update_meta_json_status(fund_code: str, pdf_folder_name: str, updates: dict) -> None:
+    meta_path = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "meta.json")
+    if not os.path.exists(meta_path):
+        return
+    try:
+        meta = safe_json_load(meta_path)
+        if isinstance(meta, dict):
+            meta.update(updates)
+            safe_json_dump(meta, meta_path)
+    except Exception as e:
+        logging.warning(f"Failed to update meta.json {meta_path}: {e}")
+        return
+
+
+def _mark_manifest_status(manifest: dict, file_name: str, updates: dict) -> None:
+    files = manifest.get("files", {})
+    entry = files.get(file_name)
+    if not isinstance(entry, dict):
+        return
+    entry.update(updates)
+    files[file_name] = entry
+    manifest["files"] = files
+
+
+def _ensure_manifest_entry(manifest: dict, file_info: dict) -> None:
+    file_name = (file_info or {}).get("file_name")
+    if not file_name:
+        return
+    files = manifest.get("files", {})
+    entry = files.get(file_name)
+    if isinstance(entry, dict):
+        return
+    new_entry = {
+        "file_name": file_name,
+        "file_path": (file_info or {}).get("file_path", ""),
+        "date": (file_info or {}).get("date", ""),
+        "fund_code": (file_info or {}).get("fund_code", ""),
+        "short_name": (file_info or {}).get("short_name", ""),
+        "announcement_title": (file_info or {}).get("announcement_title", ""),
+        "doc_type_1": (file_info or {}).get("doc_type_1", ""),
+        "doc_type_2": (file_info or {}).get("doc_type_2", ""),
+        "announcement_link": (file_info or {}).get("announcement_link", ""),
+    }
+    new_entry.update(DEFAULT_STATUS)
+    files[file_name] = new_entry
+    manifest["files"] = files
+
+
+def reconcile_manifest_text_extracted(manifest: dict) -> int:
+    updated = 0
+    files = manifest.get("files", {})
+    if not isinstance(files, dict):
+        return 0
+
+    for file_name, entry in files.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("text_extracted") is True:
+            continue
+
+        fund_code = entry.get("fund_code", "")
+        if not fund_code:
+            continue
+
+        pdf_folder_name = os.path.splitext(file_name)[0]
+        text_json_path = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "text.json")
+        if not os.path.exists(text_json_path):
+            continue
+
+        try:
+            with open(text_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            meta = data.get("metadata", {}) or {}
+            if meta.get("text_extracted") is True:
+                _mark_manifest_status(manifest, file_name, {"text_extracted": True})
+                _update_meta_json_status(fund_code, pdf_folder_name, {"text_extracted": True})
+                updated += 1
+        except Exception:
+            continue
+
+    return updated
+
+
+
+def _parse_pdf_filename(file_name: str):
+    """从文件名里尽量解析出 fund_code / short_name / announcement_title / date。"""
+    base = os.path.basename(file_name)
+
+    m = re.match(r"(\d{4}-\d{2}-\d{2})_(\d{6}\.\w{2})_(.*?)_(.+)\.pdf$", base)
+    if m:
+        date, fund_code, short_name, announcement_title = m.groups()
+        return {
+            "date": date,
+            "fund_code": fund_code,
+            "short_name": short_name,
+            "announcement_title": announcement_title,
+        }
+
+    m = re.match(r"(\d{6})-(.+)-(\d{4}-\d{2}-\d{2})\.pdf$", base)
+    if m:
+        fund_code, mid, date = m.groups()
+        if "_" in mid:
+            short_name, announcement_title = mid.split("_", 1)
+        else:
+            short_name, announcement_title = "", mid
+        return {
+            "date": date,
+            "fund_code": fund_code,
+            "short_name": short_name,
+            "announcement_title": announcement_title,
+        }
+
+    return None
+
+
+def get_pending_files_from_local():
+    """直接扫描 PDF_DIR，找出还没生成 text.json 的 PDF。"""
+    if not os.path.exists(PDF_DIR):
+        raise Exception(f"PDF_DIR 不存在: {PDF_DIR}")
+
+    pending = []
+    for fn in os.listdir(PDF_DIR):
+        if not fn.lower().endswith('.pdf'):
+            continue
+
+        parsed = _parse_pdf_filename(fn)
+        if not parsed:
+            print(f"[跳过] 文件名无法解析(需要手动改名或扩展解析规则): {fn}")
+            continue
+
+        fund_code = parsed["fund_code"]
+        pdf_folder_name = os.path.splitext(fn)[0]
+        output_json_file = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "text.json")
+
+        if os.path.exists(output_json_file):
+            try:
+                with open(output_json_file, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+                meta = existing.get("metadata", {}) or {}
+                if meta.get("text_extracted") is True:
+                    # ① merge_done=True: step5已完成正常删图 → 跳过
+                    if meta.get("merge_done") is True:
+                        continue
+                    # ② temp_pdf_images存在且非空 → 跳过
+                    temp_img_dir = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "temp_pdf_images")
+                    if os.path.isdir(temp_img_dir) and os.listdir(temp_img_dir):
+                        continue
+                    # ③ 否则: 图片丢失（curation清理但merge未完成）→ 不跳过，重渲染
+            except Exception:
+                pass
+
+        file_path = os.path.join(PDF_DIR, fn)
+        file_info = {
+            "file_name": fn,
+            "file_path": file_path,
+            "date": parsed["date"],
+            "fund_code": fund_code,
+            "short_name": parsed["short_name"],
+            "announcement_title": parsed["announcement_title"],
+            "doc_type_1": "",
+            "doc_type_2": "",
+            "announcement_link": "",
+            "text_extracted": False,
+            "table_detection_vector_done": False,
+            "table_detection_scan_done": False,
+            "table_describe_done": False,
+            "not_table_describe_done": False,
+            "merge_done": False,
+            "text_segmentation": False,
+            "embedding_done": False,
+            "vector_database_done": False,
+            "elasticsearch_database_done": False
+        }
+        pending.append(file_info)
+
+    return pending
+
+
+def clean_and_reorganize_text(text: str, title_max_length: int = 30) -> str:
+    """
+    清洗并重新组织矢量提取文本，使其更符合原文排版。
+    """
+    lines = text.split('\n')
+    cleaned_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        if len(line) < title_max_length and not re.search(r'\p{P}+$', line):
+            cleaned_lines.append(line)
+            i += 1
+            continue
+
+        current_line = line
+        while i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if not next_line:
+                i += 1
+                continue
+            # 如果当前行不以句号结尾，并且下一行没有以空格/制表符开始，则合并到同一行
+            if not re.search(r'[。]$', current_line) and not next_line.startswith((' ', '\t')):
+                current_line += next_line
+                i += 1
+            else:
+                break
+        cleaned_lines.append(current_line)
+        i += 1
+
+    return '\n'.join(cleaned_lines)
+
+
+def get_cropped_bbox(pdf_page, top_ratio=0.08, bottom_ratio=0.08):
+    """
+    返回裁剪掉页眉和页脚的区域，用于矢量文字提取。
+    """
+    parent_bbox = pdf_page.bbox
+    px0, py0, px1, py1 = parent_bbox
+    width = px1 - px0
+    height = py1 - py0
+    top = py0 + height * top_ratio
+    bottom = py0 + height * (1 - bottom_ratio)
+    return (px0, top, px1, bottom)
+
+
+def extract_text_from_vector_page(pdf_page) -> str:
+    """
+    提取矢量页中的文字，并进行简单清洗。
+    """
+    bbox = get_cropped_bbox(pdf_page)
+    cropped_page = pdf_page.within_bbox(bbox)
+    text = cropped_page.extract_text() or ""
+    return clean_and_reorganize_text(text)
+
+
+def is_header_or_footer(text: str) -> bool:
+    """
+    判断文本是否仅是页眉/页脚（如只有页码等）。
+    """
+    return re.match(r'^\d+$', text.strip()) is not None
+
+
+def convert_scanned_page_to_image(pdf_path: str, page_number: int, dpi: int, temp_img_dir: str) -> None:
+    """
+    扫描页只需转为图片存储到 temp_img_dir 文件夹。
+    使用 dpi=300，以加快处理并减少磁盘占用。
+    在转换前会先检查目标图片是否已存在，若存在则跳过转换。
+    """
+    image_path = os.path.join(temp_img_dir, f"page_{page_number}.png")
+    if os.path.exists(image_path):
+        print(f"[转换图片] 第 {page_number} 页图片已存在，跳过转换。")
+        return
+    print(f"[转换图片] 开始处理PDF第 {page_number} 页...")
+    pdf_document = fitz.open(pdf_path)
+    page = pdf_document.load_page(page_number - 1)
+    pix = page.get_pixmap(dpi=dpi)
+    pix.save(image_path)
+    pdf_document.close()
+    print(f"[转换图片] 已保存图片至 {image_path}")
+
+
+
+
+def process_single_file(args):
+    """
+    子进程处理函数：
+    负责处理传入的单个 file_info 所对应的 PDF。
+
+    注意：
+    - 每个进程只处理一个 PDF，因此可以安全地进行 PDF 与相应 JSON 的读写。
+    - 处理结束后返回更新过的 file_info，用于标记 text_extracted=True。
+    - 如果遇到异常则会写入日志并跳过该文件。
+    """
+    file_info, log_file_name = args
+    pdf_path = os.path.join(PDF_DIR, file_info["file_name"])
+    file_name = file_info["file_name"]
+
+    # 输出目录
+    fund_folder_dir = os.path.join(OUTPUT_DIR, file_info["fund_code"])
+    os.makedirs(fund_folder_dir, exist_ok=True)
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    pdf_folder_dir = os.path.join(fund_folder_dir, pdf_folder_name)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+    # 统一使用简短文件名，避免超长路径/文件名导致报错
+    output_json_file = os.path.join(pdf_folder_dir, "text.json")
+
+    if os.path.exists(output_json_file):
+        with open(output_json_file, 'r', encoding='utf-8') as f:
+            existing_data = json.load(f)
+        file_pages_dict = existing_data.get("pages", {})
+    else:
+        file_pages_dict = {}
+    # 用于存放扫描页转换后的图片
+    temp_img_dir = os.path.join(pdf_folder_dir, "temp_pdf_images")
+    os.makedirs(temp_img_dir, exist_ok=True)
+    # 表格图片目录（如果有）
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"[PDF处理] 文件 {pdf_path} 共 {total_pages} 页")
+            for i in range(total_pages):
+                page_number = i + 1
+                if str(page_number) in file_pages_dict:
+                    print(f"[页面跳过] 第 {page_number} 页已处理，跳过。")
+                    continue
+                print(f"[页面处理] 开始处理第 {page_number} 页")
+                page = pdf.pages[i]
+
+                # 矢量文本提取
+                vector_text = extract_text_from_vector_page(page)
+
+                # —— 新增：乱码检测 —— #
+                # 如果包含 (cid:数字)，视为乱码
+                is_cid_garbled = bool(re.search(r'\(cid:\d+\)', vector_text))
+                # 计算汉字数量
+                han_count = len(re.findall(r'[\u4e00-\u9fff]', vector_text))
+                is_low_chinese = han_count < PAGE_CHAR_THRESHOLD
+
+                # 决策：既不是乱码也有足够汉字，才当做矢量页
+                if (not is_cid_garbled
+                        and not is_low_chinese
+                        and len(vector_text) >= PAGE_CHAR_THRESHOLD):
+
+                    current_text = vector_text
+                    print(f"[矢量提取成功] 第 {page_number} 页, 文本长度: {len(vector_text)}, 汉字数: {han_count}")
+
+                    if is_header_or_footer(current_text.strip()):
+                        print(f"[忽略页眉页脚] 第 {page_number} 页")
+                        current_text = ""
+
+                    page_metadata = file_info.copy()
+                    page_metadata.update({
+                        "source_file": file_info["file_name"],
+                        "page_num": page_number
+                    })
+                    
+                    file_pages_dict[str(page_number)] = {
+                        "text": current_text,
+                        "metadata": page_metadata
+                    }
+
+                    final_data = {"pages": file_pages_dict, "metadata": file_info}
+                    with open(output_json_file, 'w', encoding='utf-8') as f:
+                        json.dump(final_data, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+                    print(f"[页面保存] 第 {page_number} 页内容已保存 -> {output_json_file}")
+
+                else:
+                    # 当作扫描页：包括文字提取不足或乱码情况
+                    print(f"[矢量提取不足或乱码] 第 {page_number} 页, 长度 {len(vector_text)}, 汉字数 {han_count}")
+                    convert_scanned_page_to_image(pdf_path, page_number, 300, temp_img_dir)
+
+    except Exception as e:
+        print(f"[错误] 文件 {pdf_path} 处理失败: {e}")
+        with open(log_file_name, "a", encoding="utf-8") as log_f:
+            log_f.write(f"文件 {pdf_path} 处理失败\n原因: {e}\n\n")
+        return file_info  # 不改 text_extracted
+
+    file_info["text_extracted"] = True
+
+    try:
+        if os.path.exists(output_json_file):
+            with open(output_json_file, 'r', encoding='utf-8') as f:
+                latest = json.load(f)
+        else:
+            latest = {"pages": file_pages_dict, "metadata": file_info}
+        latest_meta = latest.get("metadata", {}) or {}
+        latest_meta.update({"text_extracted": True})
+        latest["metadata"] = latest_meta
+        with open(output_json_file, 'w', encoding='utf-8') as f:
+            json.dump(latest, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+    except Exception as e:
+        print(f"[警告] 写回 text.json 元数据失败: {file_name}, 原因: {e}")
+
+    return file_info
+
+
+def main():
+    log_file_name = os.path.join(SCRIPT_DIR, "extract_text_onlyvactor_log.txt")
+
+    manifest = load_manifest()
+    # [BATCH-FIX] manifest reconcile removed — rebuilt by rebuild_manifest.py after step completes
+
+    # 从本地目录扫描待处理文件
+    try:
+        pending_files = get_pending_files_from_local()
+    except Exception as e:
+        print(f"[错误] 扫描本地PDF目录失败: {e}")
+        logger.warning(f"扫描本地PDF目录失败: {e}")
+        return
+
+    tasks = []
+    for file_info in pending_files:
+        tasks.append((file_info, log_file_name))
+
+    total_to_process = len(tasks)
+    if total_to_process == 0:
+        print("没有文件需要处理。")
+        logger.warning("没有文件需要处理。")
+        return
+
+    success_count = 0
+    fail_list = []
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+        future_map = {executor.submit(process_single_file, t): t for t in tasks}
+        for future in concurrent.futures.as_completed(future_map):
+            file_info, _ = future_map[future]
+            try:
+                updated_info = future.result()
+                if updated_info.get("text_extracted") is True:
+                    success_count += 1
+                    try:
+                        file_name = updated_info.get("file_name") or file_info.get("file_name")
+                        fund_code = updated_info.get("fund_code") or file_info.get("fund_code")
+                        if file_name and fund_code:
+                            pdf_folder_name = os.path.splitext(file_name)[0]
+                            # [BATCH-FIX] manifest update removed — rebuilt by rebuild_manifest.py
+                            _update_meta_json_status(fund_code, pdf_folder_name, {"text_extracted": True})
+                    except Exception:
+                        pass
+                else:
+                    fail_list.append((file_info["file_name"], "未设置 text_extracted"))
+            except Exception as e:
+                fail_list.append((file_info["file_name"], str(e)))
+
+    remain = total_to_process - success_count
+    print(f"[完成] 所有文件处理结束, 成功: {success_count}, 失败: {remain}.")
+    logger.warning(f"[完成] 所有文件处理结束。")
+    logger.warning(f"本次处理文件数: {total_to_process}, 成功: {success_count}, 失败: {remain}")
+    if fail_list:
+        logger.warning("失败列表:")
+        for fname, reason in fail_list:
+            logger.warning(f"  文件: {fname}, 原因: {reason}")
+    # [BATCH-FIX] manifest save removed — rebuilt by rebuild_manifest.py after step completes
+
+
+if __name__ == "__main__":
+    main()
+
+# 强制刷新日志
+import logging
+logging.shutdown()
