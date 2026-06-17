@@ -1,28 +1,28 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-#找到本轮需要处理的pdf,更新至数据库 announcement.processed_files
+# 找到本轮需要处理的pdf（本地模式，不依赖MySQL）
 """
-step1_process_pdfs.py - 仅依赖数据库版本
+step1_process_pdfs.py - 本地台账版本（不依赖 MySQL）
 
-主要修改点:
-1) 从数据库读取已处理文件列表，不再依赖JSON文件进行去重
-2) 在解析到 PDF 文件信息后，仅插入/更新数据库 announcement.processed_files (ON DUPLICATE KEY UPDATE)
-3) 移除JSON文件操作逻辑，消除双重状态维护问题
-4) 在脚本同目录下记录日志文件 process_pdfs.log，日志级别 WARNING+，并在日志写入关键信息（总PDF数、待处理数、处理成功/失败等）
-5) 多线程方式处理PDF，处理成功后仅更新数据库状态
-6) 分别使用 get_db_config() 查询 reits库公告信息，和 get_db_announcement_config() 写 announcement库 processed_files 表
+目标：
+1) 适配两种文件名格式：
+   - 旧格式：2023-05-19_180101.SH_简称_标题.pdf
+   - 新格式：180101-标题或简称_标题-2023-05-19.pdf
+2) 不使用 MySQL：改为写本地“台账文件” processed_files_local.json
+3) 为每个 PDF 建立输出目录结构（供后续 step2/step3 使用）：
+   OUTPUT_DIR/<fund_code>/<pdf_basename>/
 
 """
 
 import os
 import re
-import time
 import logging
-import pymysql
+import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from db_config import get_db_config, get_db_announcement_config
 from file_paths_config import PDF_DIR, OUTPUT_DIR
+from common_utils import safe_json_dump, safe_json_load
 
 # ========== 日志配置 ===========
 # 创建日志目录，使用相对路径
@@ -38,112 +38,92 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# 1. 查询公告类型(在 reits库)
-def get_announcement_info_from_mysql(announcement_title, fund_code, date):
-    db_conf = get_db_config()  # reits库
-    try:
-        conn = pymysql.connect(**db_conf)
-        cursor = conn.cursor()
-        sql = """
-        SELECT 公告类型_一级, 公告类型_二级, 公告链接
-        FROM 公告信息
-        WHERE 公告标题 = %s AND 基金代码 = %s AND 公告日期 = %s
-        """
-        cursor.execute(sql, (announcement_title, fund_code, date))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if row:
-            doc_type_1 = row[0]
-            doc_type_2 = row[1] if row[1] else ""
-            announcement_link = row[2]
-            return doc_type_1, doc_type_2, announcement_link
-        else:
-            return None, None, None
-    except Exception as e:
-        print(f"数据库查询错误(reits): {e}")
-        return None, None, None
+MANIFEST_FILE = os.path.join(OUTPUT_DIR, "processed_files_local.json")
 
-# 2. 写入 announcement.processed_files (ON DUPLICATE KEY UPDATE)
-def insert_into_announcement_db(entry):
-    """
-    往 announcement.processed_files 表插入:
-      file_name(pk), file_path, date, fund_code, short_name, announcement_title, doc_type_1, doc_type_2, announcement_link
-      以及后续处理字段(text_extracted等)初始值都为 'false'
-    若主键冲突 => 更新 file_path, date, fund_code, short_name, announcement_title, doc_type_1, doc_type_2, announcement_link
-    """
-    db_conf = get_db_announcement_config()
-    conn = None
-    try:
-        conn = pymysql.connect(**db_conf)
-        cursor = conn.cursor()
-        sql = """
-        INSERT INTO processed_files (
-          file_name, file_path, date, fund_code, short_name, announcement_title,
-          doc_type_1, doc_type_2, announcement_link,
-          text_extracted, table_detection_vector_done, table_detection_scan_done,
-          table_describe_done, not_table_describe_done, merge_done,
-          text_segmentation, embedding_done, vector_database_done, elasticsearch_database_done
-        ) VALUES (
-          %s, %s, %s, %s, %s, %s,
-          %s, %s, %s,
-          'false','false','false','false','false','false','false','false','false','false'
-        )
-        ON DUPLICATE KEY UPDATE
-          file_path=VALUES(file_path),
-          date=VALUES(date),
-          fund_code=VALUES(fund_code),
-          short_name=VALUES(short_name),
-          announcement_title=VALUES(announcement_title),
-          doc_type_1=VALUES(doc_type_1),
-          doc_type_2=VALUES(doc_type_2),
-          announcement_link=VALUES(announcement_link)
-        """
-        vals = (
-            entry["file_name"],
-            entry["file_path"],
-            entry["date"],
-            entry["fund_code"],
-            entry["short_name"],
-            entry["announcement_title"],
-            entry["doc_type_1"],
-            entry["doc_type_2"],
-            entry["announcement_link"]
-        )
-        cursor.execute(sql, vals)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-    except Exception as e:
-        if conn:
-            conn.rollback()
-            conn.close()
-        # 抛异常给外部 process_pdf 捕获
-        raise e
+DEFAULT_STATUS = {
+    "text_extracted": False,
+    "table_detection_vector_done": False,
+    "table_detection_scan_done": False,
+    "table_describe_done": False,
+    "not_table_describe_done": False,
+    "merge_done": False,
+    "text_segmentation": False,
+    "embedding_done": False,
+    "vector_database_done": False,
+    "elasticsearch_database_done": False,
+}
+
+def parse_pdf_filename(file_name: str):
+    base = os.path.basename(file_name)
+    stem, ext = os.path.splitext(base)
+    if ext.lower() != ".pdf":
+        return None
+
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})_(\d{6}\.\w{2})_(.*?)_(.+)$", stem)
+    if m:
+        date, fund_code, short_name, announcement_title = m.groups()
+        return {
+            "date": date,
+            "fund_code": fund_code,
+            "short_name": short_name,
+            "announcement_title": announcement_title,
+        }
+
+    m = re.match(r"^(\d{6})-(.*)-(\d{4}-\d{2}-\d{2})$", stem)
+    if m:
+        fund_code, middle, date = m.groups()
+        if "_" in middle:
+            short_name, announcement_title = middle.split("_", 1)
+        else:
+            short_name, announcement_title = "", middle
+        return {
+            "date": date,
+            "fund_code": fund_code,
+            "short_name": short_name,
+            "announcement_title": announcement_title,
+        }
+
+    return None
+
+def load_manifest():
+    if os.path.exists(MANIFEST_FILE):
+        try:
+            data = safe_json_load(MANIFEST_FILE)
+            if isinstance(data, dict) and "files" in data and isinstance(data["files"], dict):
+                return data
+        except Exception:
+            pass
+    return {
+        "generated_at": "",
+        "source_dir": PDF_DIR,
+        "output_dir": OUTPUT_DIR,
+        "files": {}
+    }
+
+def save_manifest(manifest):
+    manifest["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_json_dump(manifest, MANIFEST_FILE)
 
 # 单个 PDF 文件多线程处理
 def process_pdf(file):
-    # 先判断是否 .pdf
-    if not file.lower().endswith('.pdf'):
+    parsed = parse_pdf_filename(file)
+    if not parsed:
         return None
 
-    # 用正则提取 date, fund_code, short_name, announcement_title
-    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{6}\.\w{2})_(.*?)_(.+)\.pdf")
-    match = pattern.match(file)
-    if not match:
-        print(f"文件名格式不匹配: {file}")
-        return None
-
-    date, fund_code, short_name, announcement_title = match.groups()
     file_path = os.path.join(PDF_DIR, file)
-    print(f"解析文件: {file} => 日期:{date},基金代码:{fund_code},基金简称:{short_name},公告:{announcement_title}")
-
-    # 查询 doc_type_1, doc_type_2, link
-    doc_type_1, doc_type_2, announcement_link = get_announcement_info_from_mysql(announcement_title, fund_code, date)
-    if doc_type_1 is None:
-        print(f"未找到公告类型匹配记录: {file}")
+    if not os.path.exists(file_path):
         return None
+    # 解析符号链接获取真实路径
+    file_path = os.path.realpath(file_path)
+
+    fund_code = parsed["fund_code"]
+    short_name = parsed["short_name"]
+    announcement_title = parsed["announcement_title"]
+    date = parsed["date"]
+
+    pdf_folder_name = os.path.splitext(file)[0]
+    pdf_folder_dir = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
 
     entry = {
         "file_name": file,
@@ -152,61 +132,43 @@ def process_pdf(file):
         "fund_code": fund_code,
         "short_name": short_name,
         "announcement_title": announcement_title,
-        "doc_type_1": doc_type_1,
-        "doc_type_2": doc_type_2,
-        "announcement_link": announcement_link
+        "doc_type_1": "",
+        "doc_type_2": "",
+        "announcement_link": "",
     }
-    # 写数据库
-    try:
-        ok = insert_into_announcement_db(entry)
-        if ok:
-            return (fund_code, entry)
-        else:
-            return None
-    except Exception as e:
-        print(f"插入数据库失败: {file}, 原因:{e}")
-        return None
+    entry.update(DEFAULT_STATUS)
 
-def get_processed_files_from_db():
-    """从数据库获取已处理的文件列表"""
-    processed_files = set()
-    try:
-        db_config = get_db_announcement_config()
-        connection = pymysql.connect(**db_config)
-        with connection.cursor() as cursor:
-            sql = "SELECT file_name FROM processed_files"
-            cursor.execute(sql)
-            results = cursor.fetchall()
-            processed_files = {row[0] for row in results}
-        connection.close()
-        print(f"从数据库获取到 {len(processed_files)} 个已处理文件")
-        return processed_files
-    except Exception as e:
-        print(f"数据库查询失败: {str(e)}")
-        return set()
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    safe_json_dump(entry, meta_path)
+
+    print(f"解析文件: {file} => 日期:{date},基金代码:{fund_code},基金简称:{short_name},公告:{announcement_title}")
+    return (fund_code, entry)
 
 def process_pdfs():
-    # 从数据库获取已处理文件列表
-    processed_files_db = get_processed_files_from_db()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    manifest = load_manifest()
+    processed_files = set(manifest.get("files", {}).keys())
+
+    if not os.path.exists(PDF_DIR):
+        print(f"PDF目录不存在: {PDF_DIR}")
+        logger.warning(f"PDF目录不存在: {PDF_DIR}")
+        return
+
     pdf_files = os.listdir(PDF_DIR)
     total_pdf_files = len(pdf_files)
 
-    # 匹配正则
-    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{6}\.\w{2})_(.*?)_(.+)\.pdf")
-
-    # 过滤已处理（只检查数据库）
     files_to_process = []
+    skipped_bad_name = 0
     for file in pdf_files:
-        if file.lower().endswith('.pdf'):
-            m = pattern.match(file)
-            if not m:
-                print(f"文件名格式不匹配: {file}")
-                continue
-            # 只检查数据库中是否已存在
-            if file in processed_files_db:
-                print(f"文件 {file} 已处理, 跳过.")
-                continue
-            files_to_process.append(file)
+        if not file.lower().endswith(".pdf"):
+            continue
+        if file in processed_files:
+            continue
+        if not parse_pdf_filename(file):
+            skipped_bad_name += 1
+            continue
+        files_to_process.append(file)
 
     pending_count = len(files_to_process)
     results = []
@@ -225,33 +187,28 @@ def process_pdfs():
             except Exception as e:
                 errors.append((f, str(e)))
 
-    # 统计结果（不再写JSON文件）
+    # 写入本地台账
+    for _, entry in results:
+        manifest["files"][entry["file_name"]] = entry
+    try:
+        save_manifest(manifest)
+    except Exception as e:
+        errors.append((MANIFEST_FILE, f"写入台账失败: {e}"))
+
     inserted_count = len(results)
     
-    # 从数据库重新统计
-    updated_processed_files_db = get_processed_files_from_db()
-    total_processed = len(updated_processed_files_db)
-    
-    # 按基金代码分组统计
     fund_groups = {}
-    try:
-        db_config = get_db_announcement_config()
-        connection = pymysql.connect(**db_config)
-        with connection.cursor() as cursor:
-            sql = "SELECT fund_code, COUNT(*) FROM processed_files GROUP BY fund_code"
-            cursor.execute(sql)
-            fund_groups = dict(cursor.fetchall())
-        connection.close()
-    except Exception as e:
-        print(f"统计分组失败: {e}")
+    for _, entry in results:
+        fc = entry.get("fund_code", "")
+        fund_groups[fc] = fund_groups.get(fc, 0) + 1
     group_count = len(fund_groups)
 
     # 终端输出
     print("\n===========================================")
     print(f"总PDF文件数: {total_pdf_files}")
     print(f"待处理文件数量: {pending_count}")
-    print(f"已处理基金组数: {group_count}, 总处理文件数: {total_processed}")
-    print(f"本次处理文件数: {len(files_to_process)}, 成功入库: {inserted_count}, 失败: {len(errors)}")
+    print(f"文件名不符合规则(跳过): {skipped_bad_name}")
+    print(f"本次处理基金组数: {group_count}, 本次登记文件数: {inserted_count}, 失败: {len(errors)}")
     if errors:
         print("失败文件:")
         for (fname, reason) in errors:
@@ -261,8 +218,8 @@ def process_pdfs():
     # 写日志
     logger.warning(f"总PDF文件数: {total_pdf_files}")
     logger.warning(f"待处理文件数量: {pending_count}")
-    logger.warning(f"已处理基金组数: {group_count}, 总处理文件数: {total_processed}")
-    logger.warning(f"本次处理文件数: {len(files_to_process)}, 成功写DB: {inserted_count}, 失败: {len(errors)}")
+    logger.warning(f"文件名不符合规则(跳过): {skipped_bad_name}")
+    logger.warning(f"本次处理基金组数: {group_count}, 本次登记文件数: {inserted_count}, 失败: {len(errors)}")
     if errors:
         logger.warning(f"本次处理失败共 {len(errors)} 个:")
         for (fname, reason) in errors:

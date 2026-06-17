@@ -1,13 +1,11 @@
-# file_paths_config.py
-# 这里存放文件路径的配置
+# file_paths_config.py — REITs Text Data Pipeline
+# 所有路径限定在 /Users/pyemini/REITs/ 内
 
-# PDF 文件目录路径
-PDF_DIR = r"***/downloaded_pdfs/"
+# PDF 原始文件目录（扁平化符号链接，指向 REITs_notice/ 子目录）
+PDF_DIR = r"/Users/pyemini/REITs/REITs_announcements/_flat_pdfs"
 
-# 输出文件夹路径
-OUTPUT_DIR = r"***/announcement_document_processing/"
+# RAG 管道输出目录（结构: {fund_code}/{doc_type}/{pdf_folder}/）
+OUTPUT_DIR = r"/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/announcement_document_processing_local"
 
-
-#table_transformer模型路径
-table_transformer_path = r"***/table-transformer-detection"
-
+# table_transformer 模型路径
+table_transformer_path = r"/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/table-transformer-detection"

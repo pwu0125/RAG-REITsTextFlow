@@ -8,7 +8,7 @@ from model_config import MODEL_CONFIG  # 引入配置文件
 
 # 默认的大模型厂商和模型名称
 DEFAULT_VENDOR = "ali"
-DEFAULT_MODEL_NAME = "qwen-vl-max-latest"
+DEFAULT_MODEL_NAME = "qwen-vl-max"
 
 
 def get_model_config(vendor: str, model_name: str) -> dict:

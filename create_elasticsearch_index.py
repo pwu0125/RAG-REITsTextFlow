@@ -10,8 +10,7 @@ from db_config import get_elasticsearch_config
 es_config = get_elasticsearch_config()
 
 es = Elasticsearch(
-    [f"{es_config.get('scheme', 'http')}://{es_config['host']}:{es_config['port']}"],
-    basic_auth=(es_config['username'], es_config['password']),
+    ["http://localhost:9200"],
     verify_certs=False
 )
 

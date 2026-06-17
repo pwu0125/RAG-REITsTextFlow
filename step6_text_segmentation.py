@@ -17,11 +17,10 @@ import re
 import json
 import time
 import logging
-import pymysql
+import threading
 
 import file_paths_config
-from db_config import get_db_announcement_config  # 获取 announcement 数据库配置信息
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
 
 # ================== 日志配置 ===================
 # 获取脚本所在目录，确保日志文件生成在log目录下
@@ -38,78 +37,123 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 # ================== 常量参数 ===================
 MULTIFILE_OUTPUT_DIR = file_paths_config.OUTPUT_DIR
+MANIFEST_FILE = os.path.join(MULTIFILE_OUTPUT_DIR, "processed_files_local.json")
+json_lock = threading.Lock()
 
 MIN_LEN = 200       # 普通文本块最少字符数
 MAX_LEN = 1500      # 普通文本块最多字符数(强制切分)
 TABLE_START = "## 表格主题"
 TABLE_END = "表格内容描述完毕。"
 
-def get_announcement_connection():
-    """
-    获取数据库 announcement 的连接
-    """
-    config = get_db_announcement_config()
-    return pymysql.connect(
-        host=config["host"],
-        port=config["port"],
-        user=config["user"],
-        password=config["password"],
-        database=config["database"],
-        charset=config["charset"],
-        cursorclass=pymysql.cursors.DictCursor
-    )
+
+def _safe_read_json(path):
+    try:
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("merge_done") is not True:
+            continue
+        if status.get("text_segmentation") is True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "merge_done": True,
+            "text_segmentation": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fc in grouped_files:
+        grouped_files[fc].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_text_segmentation_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["text_segmentation"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["text_segmentation"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    manifest = _safe_read_json(MANIFEST_FILE) or {"files": {}}
+    if "files" not in manifest or not isinstance(manifest["files"], dict):
+        manifest["files"] = {}
+    entry = manifest["files"].get(file_name, {}) or {}
+    entry.update(file_info)
+    entry["text_segmentation"] = True
+    manifest["files"][file_name] = entry
+    safe_json_dump(manifest, MANIFEST_FILE)
+    return True
+
 
 def get_pending_files_from_db():
-    """
-    从数据库获取需要进行文本切分的文件
-    条件: merge_done='true' AND text_segmentation='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-                   doc_type_1, doc_type_2, announcement_link, merge_done, text_segmentation
-            FROM processed_files 
-            WHERE merge_done='true' 
-              AND text_segmentation='false' 
-              AND doc_type_1 != '无关'
-            ORDER BY fund_code, file_name
-            """
-            cursor.execute(sql)
-            results = cursor.fetchall()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
-    except Exception as e:
-        logging.error(f"数据库查询失败: {e}")
-        raise e
-
-def update_pdf_status_in_db(file_name, status_field, status_value):
-    """
-    更新数据库中单个PDF文件的状态
-    """
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = f"UPDATE processed_files SET {status_field}=%s WHERE file_name=%s"
-            cursor.execute(sql, (status_value, file_name))
-            conn.commit()
-        conn.close()
-        logging.info(f"已更新数据库 {file_name} 的 {status_field}={status_value}")
-    except Exception as e:
-        logging.error(f"更新数据库状态失败: {e}")
-        raise e
+    return get_pending_files_from_local()
 
 def load_json_file(path):
     with open(path, 'r', encoding='utf-8') as f:
@@ -339,96 +383,7 @@ def get_metadata_for_segment(segment_start, segment_end, page_map, pages_dict):
     return meta
 
 def insert_segmentation_to_db(chunks):
-    """
-    插入前, 先根据 source_file 删除已有记录,
-    再插入全部chunks; 如出错则 rollback.
-    """
-    if not chunks:
-        return
-
-    db_conf = get_db_announcement_config()
-    try:
-        conn = pymysql.connect(
-            host=db_conf["host"],
-            port=db_conf["port"],
-            user=db_conf["user"],
-            password=db_conf["password"],
-            database=db_conf["database"],
-            charset=db_conf["charset"],
-            cursorclass=pymysql.cursors.DictCursor
-        )
-    except Exception as e:
-        logger.warning(f"数据库连接失败: {e}")
-        return
-
-    sql_insert = """
-    INSERT INTO text_segmentation_embedding
-    (global_id, chunk_id, file_path, date, fund_code, short_name, announcement_title,
-     doc_type_1, doc_type_2, announcement_link, source_file, page_num, picture_path,
-     char_count, prev_chunks, next_chunks, text, embedding)
-    VALUES
-    (%(global_id)s, %(chunk_id)s, %(file_path)s, %(date)s, %(fund_code)s, %(short_name)s, %(announcement_title)s,
-     %(doc_type_1)s, %(doc_type_2)s, %(announcement_link)s, %(source_file)s, %(page_num)s, %(picture_path)s,
-     %(char_count)s, %(prev_chunks)s, %(next_chunks)s, %(text)s, %(embedding)s)
-    ON DUPLICATE KEY UPDATE
-        chunk_id=VALUES(chunk_id),
-        file_path=VALUES(file_path),
-        date=VALUES(date),
-        fund_code=VALUES(fund_code),
-        short_name=VALUES(short_name),
-        announcement_title=VALUES(announcement_title),
-        doc_type_1=VALUES(doc_type_1),
-        doc_type_2=VALUES(doc_type_2),
-        announcement_link=VALUES(announcement_link),
-        source_file=VALUES(source_file),
-        page_num=VALUES(page_num),
-        picture_path=VALUES(picture_path),
-        char_count=VALUES(char_count),
-        prev_chunks=VALUES(prev_chunks),
-        next_chunks=VALUES(next_chunks),
-        text=VALUES(text),
-        embedding=VALUES(embedding)
-    """
-
-    source_file_val = chunks[0]["metadata"].get("source_file", "")
-    try:
-        with conn.cursor() as cursor:
-            if source_file_val:
-                del_sql = "DELETE FROM text_segmentation_embedding WHERE source_file = %s"
-                cursor.execute(del_sql, (source_file_val,))
-            for chunk in chunks:
-                meta = chunk["metadata"]
-                row_data = {
-                    "global_id": chunk["global_id"],
-                    "chunk_id": chunk["chunk_id"],
-                    "file_path": meta.get("file_path", ""),
-                    "date": meta.get("date", None),
-                    "fund_code": meta.get("fund_code", ""),
-                    "short_name": meta.get("short_name", ""),
-                    "announcement_title": meta.get("announcement_title", ""),
-                    "doc_type_1": meta.get("doc_type_1", ""),
-                    "doc_type_2": meta.get("doc_type_2", ""),
-                    "announcement_link": meta.get("announcement_link", ""),
-                    "source_file": meta.get("source_file", ""),
-                    "page_num": meta.get("page_num", ""),
-                    "picture_path": meta.get("picture_path", ""),
-                    "char_count": meta.get("char_count", 0),
-                    "prev_chunks": json.dumps(meta.get("prev_chunks", []), ensure_ascii=False),
-                    "next_chunks": json.dumps(meta.get("next_chunks", []), ensure_ascii=False),
-                    "text": chunk["text"],
-                    "embedding": "{}"
-                }
-                cursor.execute(sql_insert, row_data)
-        conn.commit()
-    except Exception as e:
-        logger.warning(f"批量插入失败: {e}")
-        try:
-            conn.rollback()
-        except:
-            pass
-        raise
-    finally:
-        conn.close()
+    return
 
 def process_pdf_segmentation(pdf_folder):
     """
@@ -508,16 +463,10 @@ def process_pdf_segmentation(pdf_folder):
     save_json_file(final_chunks, output_path)
     print(f"已保存切分结果到: {output_path}")
 
-    try:
-        insert_segmentation_to_db(final_chunks)
-    except Exception as e:
-        logger.warning(f"文件 {pdf_folder_name} 插入数据库失败: {e}")
-        return False
-
     return True
 
 def main():
-    processed_files = get_pending_files_from_db()
+    processed_files = get_pending_files_from_local()
     if not processed_files:
         print("没有找到需要处理的文件。")
         logger.warning("没有找到需要处理的文件。")
@@ -541,25 +490,14 @@ def main():
 
     for fund_code, pdf_info in files_to_process:
         file_name = pdf_info.get("file_name", "")
-        fund_folder = None
-        try:
-            for folder in os.listdir(MULTIFILE_OUTPUT_DIR):
-                if folder.startswith(fund_code):
-                    fund_folder = folder
-                    break
-        except Exception as e:
-            logger.warning(f"读取目录 {MULTIFILE_OUTPUT_DIR} 出错: {e}")
-            failed_files.append(file_name)
-            continue
-
-        if not fund_folder:
-            print(f"未找到基金文件夹, 代码: {fund_code}, 跳过 {file_name}")
-            logger.warning(f"未找到基金文件夹, 代码: {fund_code}, 跳过 {file_name}")
-            failed_files.append(file_name)
-            continue
-
         pdf_folder_name = os.path.splitext(file_name)[0]
-        pdf_folder = os.path.join(MULTIFILE_OUTPUT_DIR, fund_folder, pdf_folder_name)
+        pdf_folder = os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+        if not os.path.exists(pdf_folder):
+            print(f"未找到PDF文件夹, 跳过 {file_name}: {pdf_folder}")
+            logger.warning(f"未找到PDF文件夹, 跳过 {file_name}: {pdf_folder}")
+            failed_files.append(file_name)
+            continue
+
         print(f"开始处理 {file_name} 的数据切分...")
 
         success = False
@@ -570,14 +508,14 @@ def main():
             success = False
 
         if success:
-            # 更新数据库 processed_files 表，仅更新 text_segmentation 字段
-            try:
-                update_pdf_status_in_db(file_name, "text_segmentation", "true")
+            with json_lock:
+                ok = update_local_text_segmentation_done(pdf_info)
+            if ok:
                 print(f"已完成 {file_name} 的文本切分处理。")
                 processed_count += 1
-            except Exception as e:
-                print(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                logger.warning(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
+            else:
+                print(f"文件 {file_name} 更新本地状态 text_segmentation 失败。")
+                logger.warning(f"文件 {file_name} 更新本地状态 text_segmentation 失败。")
                 failed_files.append(file_name)
         else:
             print(f"{file_name} 处理文本切分失败。")

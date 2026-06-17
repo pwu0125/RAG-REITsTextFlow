@@ -1,197 +1,300 @@
-# RAG-REITsTextFlow
+# RAG-REITsTextFlow — REITs 公告 PDF 全自动文本提取管道
 
-一个用于REITs公告PDF文档处理项目。
+> **Fork from** [adennng/RAG-REITsTextFlow](https://github.com/adennng/RAG-REITsTextFlow)  
+> **Maintainer**: [pwu0125](https://github.com/pwu0125)  
+> **Last update**: 2026-06-17
 
-## 项目简介
+本项目从原始仓库 fork 而来，在原有 PDF 提取流程基础上进行了**大规模架构重构和工程加固**——新增管道编排器、GATE 质量门控、元数据一致性治理、多级重试与崩溃恢复，使管道从"手动逐步执行"升级为"一键批量自动化运行"。
 
-本项目是一个专门用于处理基础设施公募REITs（Real Estate Investment Trusts）公告PDF文件清洗的完整数据处理管道。系统能够自动化地将PDF公告文档转换为结构化数据，能够检测表格、实现跨页表格拼接，并将表格内容还原为便于检索的文本信息。并构建向量数据库和 Elasticsearch ，实现本地知识库，以支持智能检索与问答系统。
+---
 
-## 🚀 主要功能
+## 📊 生产验证结果
 
-### 核心处理流程
+| 指标 | 数据 |
+|------|------|
+| 处理文档总数 | **1,425 份** REITs 公告 PDF |
+| 覆盖 REITs 代码 | **87 个** (全量) |
+| Elasticsearch 入库 | **165 万** text chunks |
+| Milvus 向量库 | **110 万** embedding vectors |
+| 批次通过率 | **65/87 codes** 全链路闭环 |
 
-```mermaid
-graph TD
-    A[PDF文档输入] --> B[步骤1: PDF文本提取]
-    B --> B1[矢量页: 提取文本信息]
-    B --> B2[扫描页: 转换为图片]
-    
-    B1 --> C1[矢量页表格检测、跨页表格页拼接<br/>pdfplumber]
-    B2 --> C2[扫描页表格检测、跨页表格页拼接<br/>transformers+多模态LLM+cv2+pytesseract]
-    
-    C1 --> D[步骤3: 图像描述生成]
-    C2 --> D
-    D --> D1[表格页: 生成表格页文本信息及表格描述<br/>两次多模态LLM + OCR]
-    D --> D2[非表格页: 生成文本信息<br/>多模态LLM + OCR]
-    
-    D1 --> E[步骤4: 文本合并]
-    D2 --> E
-    E --> F[步骤5: 智能文本切分<br/>保护表格完整性]
-    F --> G[步骤6: 文本向量化]
-    G --> H[步骤7: 数据存储]
-    H --> I[Elasticsearch]
-    H --> J[Milvus向量库]
-    
-    style A fill:#e1f5fe
-    style E fill:#f0f4c3
-    style H fill:#f3e5f5
-    style I fill:#e8f5e8
-    style J fill:#fff3e0
+---
+
+## 🔄 修改内容（与原始仓库对比）
+
+### 🆕 新增文件
+
+#### 管道编排与质量控制
+| 文件 | 功能 | 原因 |
+|------|------|------|
+| `pipeline_controller.py` | **RunConductor** — 批次管道端到端编排器。支持 pre-flight 检查(Docker/磁盘/MetaGuard)、checkpoint/resume、三步重试 | 原仓库需手动逐步运行 12 个脚本，无法批量无人值守执行 |
+| `gate1_coverage_check.py` | **GATE1 覆盖率检查** — 验证 table_describe/not_table_describe/text.json 三项完整，≥99% 通过 | 需在 merge 前确保提取质量，不通过则保留图片诊断 |
+| `gate2_accuracy_check.py` | **GATE2 精度检查** — 验证 ES 索引文档数+字段完整性，≥99.5% 通过 | 入库前质量门控，防止脏数据进入检索库 |
+| `batch_runner.py` | 批次执行器 — 处理批次内的所有 PDF | 简化批量操作 |
+| `run_batch.py` | 单步/全量批次入口 | 支持 `--full` 全管道或 `--script stepX` 单步 |
+| `run_step.py` | 单步轻量执行器 | 调试和修复时使用 |
+
+#### 元数据治理（三位一体体系）
+| 文件 | 功能 | 原因 |
+|------|------|------|
+| `reconcile_meta.py` | **标记对账** — 以 ES/Milvus 物理数据为真相锚点，按 8 条推理链(R0-R8)修正 meta.json 错误标志 | 原仓库重建 manifest 时只看磁盘文件，被 step5 删除的图片骗到，导致"假阴性" |
+| `rebuild_manifest.py` | **manifest 重建** — 从磁盘 meta.json 重建，新增 ES/Milvus 双向交叉校验 | 单向传播导致错误标志扩散 |
+| `sync_text_metadata.py` | **标志同步** — text.json metadata → meta.json 同步，防止旧标志覆盖正确值 | step5 merge 时 text.json 可能携带过期 metadata |
+
+#### 诊断与修复工具
+| 文件 | 功能 |
+|------|------|
+| `diagnose_pipeline.py` | 全管道状态诊断（从 ES/Milvus 倒推） |
+| `diagnose_pipeline_state.py` | pipeline_state.json 检查 |
+| `diagnose_full_disk.py` | 磁盘使用量诊断 |
+| `fix_meta_for_recovery.py` | 崩溃恢复标记修复 |
+| `fix_meta_phase1.py` | Phase A 全量标记清理(1,425份) |
+| `scan_progress.py` | 批次进度扫描 |
+| `scan_bad_images.py` | 坏图像扫描 |
+
+#### 基础设施
+| 文件 | 功能 |
+|------|------|
+| `ocr_router.py` | OCR 后端路由（本地 DeepSeek OCR 2 MPS vs 云端 API） |
+| `es_bulk_ingest.py` | ES 批量入库工具 |
+| `sync_all.py` | 全量三路同步(disk→meta→manifest) |
+| `BATCH_CONFIG.json` | 87 个 REITs 代码的 24 批次分组配置 |
+| `CLAUDE.md` | AI Agent 上下文文档 |
+
+---
+
+### ♻️ 修改的原有文件
+
+#### step4_1_1 — 表格描述可靠性加固
+```diff
++ 单图级 API 重试 + 指数退避(30s/60s/120s)
++ DashScope BrokenPipeError 捕获后自动重试
++ 并发控制优化
+```
+**原因**: 原始代码单次失败即放弃，B2m 批次 3/28 因代理断连失败。
+
+#### step4_2_1 — 非表描述零图修复
+```diff
++ 零图文档（无非表页）不再返回 False
++ 正确写入 ntd_done=true
+```
+**原因**: 纯矢量 PDF 无非表图，原始代码误判为失败，阻塞后续步骤。
+
+#### step5 — GATE1 两阶段提交
+```diff
++ 合并后不立即标记 merge_done（先跑 GATE1）
++ GATE1 通过 → 标记 + 删 temp_pdf_images/
++ GATE1 失败 → 保留图片 + 保留待处理状态 + sys.exit(1)
++ merge 前自动运行 sync_text_metadata
+```
+**原因**: 原始代码无 GATE1 机制，合并后直接删图——合并质量不可验证，删图后无法诊断。
+
+#### step7 — 嵌入崩溃恢复
+```diff
++ 嵌入失败捕获 + 自动重试(3次)
++ 重试耗尽后降级跳过（不阻塞管道）
+```
+**原因**: B2m 首次运行时 step7 静默崩溃，整个批次无嵌入数据需重跑。
+
+#### step3_2 — Tesseract 异常捕获
+```diff
++ 捕获 TesseractNotFoundError → OSError 基类
+```
+**原因**: macOS 上 pytesseract 抛 OSError 而非 TesseractError，原始 except 未覆盖。
+
+#### step8_1/step8_2 — ES/Milvus 入库增强
+```diff
++ 批量写入优化
++ 字段完整性校验
++ 幂等重入（delete + re-insert）
 ```
 
-#### 详细流程说明
+---
 
-1. **PDF文本提取** - 区分矢量页和扫描页，矢量页直接提取文本，扫描页转为图片处理
-2. **表格检测与跨页合并** - 矢量页使用pdfplumber，扫描页综合运用transformers模型、多模态LLM、cv2、pytesseract等智能检测并拼接跨页表格
-3. **图像描述生成** - 表格页通过多层级LLM+OCR生成表格详细描述及文本信息，非表格页使用多模态LLM+OCR提取文本
-4. **文本合并** - 智能合并和替换，生成完整文档内容
-5. **智能文本切分** - 保证表格内容完整性，避免切断表格结构
-6. **文本向量化** - 生成高质量文本嵌入向量
-7. **数据存储** - 同时支持Elasticsearch和Milvus向量数据库
+## 🏗️ 架构设计
 
-### 🔥 技术特性
-
-- **智能表格处理** - 综合运用transformers模型、多模态LLM、cv2、pytesseract等方法，自动检测表格、识别并拼接跨页表格
-
-- **LLM增强描述** - 相较于传统表格信息提取，采用大语言模型生成表格内容的语义化描述，让表格数据更易于理解和检索
-
-- **智能切分保护** - 文本分割时智能识别表格边界，确保表格内容不被破坏，保持数据完整性
-
-- **多数据库支持** - 同时支持Elasticsearch全文检索和Milvus向量检索，提供多样化的查询能力
-
-- **模块化设计** - 每个步骤独立运行，便于调试和维护，支持灵活的流程定制
-
-
-
-## 📁 项目结构
+### 管道流水线（12 步 → 8 核心步骤）
 
 ```
-rag_v2/
-├── table-transformer-detection                    # table-transformer 模型
-├── README.md                                      # 项目说明文档
-├── .gitignore                                     # Git忽略文件配置
-├── requirements.txt                               # Python依赖包列表
-│
-├── 配置文件
-│   ├── db_config.py                               # 数据库配置(MySQL、Elasticsearch、Milvus)
-│   ├── model_config.py                            # AI模型API配置(各厂商API密钥)
-│   ├── file_paths_config.py                       # 文件路径配置
-│   └── common_utils.py                            # 通用工具函数
-│
-├── 数据库创建脚本
-│   ├── create_elasticsearch_index.py              # 创建Elasticsearch索引
-│   └── create_vector_database.py                  # 创建Milvus向量数据库
-│
-├── 步骤1: PDF处理
-│   └── step1_process_pdfs.py                      # PDF文档预处理,区分矢量页和扫描页
-│
-├── 步骤2: 文本提取
-│   └── step2_extract_text_onlyvactor_multi_process.py  # 矢量页文本提取(多进程)
-│
-├── 步骤3: 表格检测与跨页合并
-│   ├── step3_cross_page_table_detector.py         # 跨页表格检测器(基础版)
-│   ├── step3_1_detection_vactor_multi_process.py  # 矢量页表格检测(多进程)
-│   └── step3_2_table_detection_scan_multifile.py  # 扫描页表格检测(多文件处理)
-│
-├── 步骤4: 图像描述生成
-│   ├── step4_compress_image.py                    # 图像压缩工具
-│   ├── step4_1_1_describe_table_images_multi_thread.py      # 表格图像描述生成(第一轮,多线程)
-│   ├── step4_1_2_describe_table_images_multi_thread_second.py  # 表格图像描述生成(第二轮,多线程)
-│   ├── step4_2_1_describe_not_table_images_llm.py # 非表格图像描述生成(LLM)
-│   ├── step4_2_2_describe_not_table_images_llm_second.py  # 非表格图像描述生成(第二轮)
-│   ├── step4_describe_not_table_images_PaddleOCR.py  # 非表格图像OCR识别(PaddleOCR)
-│   ├── step4_table_utils.py                       # 表格处理工具(单线程)
-│   ├── step4_table_utils_ali.py                   # 表格处理工具(阿里云API)
-│   ├── step4_table_utils_ali_multi_thread.py      # 表格处理工具(阿里云API,多线程)
-│   └── step4_table_utils_multi_thresd.py          # 表格处理工具(多线程)
-│
-├── 步骤5: 文本合并
-│   └── step5_merge_table_into_text.py             # 合并表格描述到正文
-│
-├── 步骤6: 文本分割
-│   └── step6_text_segmentation.py                 # 智能文本切分(保护表格完整性)
-│
-├── 步骤7: 文本向量化
-│   └── step7_text_embedding.py                    # 生成文本嵌入向量
-│
-└── 步骤8: 数据存储
-    ├── step8_1_ingest_elasticsearch_data.py       # 导入数据到Elasticsearch
-    └── step8_2_ingest_vector_database.py          # 导入数据到Milvus向量库
+┌─────────────────────────────────────────────────────────────────┐
+│                  RunConductor (pipeline_controller.py)            │
+│                                                                  │
+│  Pre-flight: reconcile_meta → Docker → Disk                     │
+│       ↓                                                         │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │ Step1 PDF→PNG                                                ││
+│  │ Step2 文本提取                                                ││
+│  │ Step3.1 向量表检测   Step3.2 扫描表检测                        ││
+│  │ Step4.1.1 LLM表格描述  Step4.2.1 LLM非表描述                  ││
+│  │ Step5 合并 + GATE1 (≥99% coverage)                            ││
+│  │      ✅ PASS → 标记merge_done + 删中间图                       ││
+│  │      ❌ FAIL → 保留全图 + 中断（修复后 --resume）               ││
+│  │ Step6 文本分段                                                 ││
+│  │ Step7 向量嵌入                                                 ││
+│  │ Step8.1 ES入库 + GATE2 (≥99.5% accuracy)                      ││
+│  │ Step8.2 Milvus入库                                            ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                                                                  │
+│  每个步骤支持: checkpoint/resume + 3次瞬时重试(30s/60s/120s)     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## ⚙️ 安装与配置
+### GATE 质量门控
 
-### 1. 环境要求
+| 门控 | 位置 | 阈值 | 检查项 | 失败行为 |
+|------|------|------|--------|----------|
+| **GATE1** | step5 之后 | ≥99% | table_describe_done / not_table_describe_done / text.json>1KB | 保留图片，管道中断 |
+| **GATE2** | step8_1 之后 | ≥99.5% | ES 索引文档数 / 字段完整性 | 管道中断 |
 
-- Python 3.8+
-- MySQL 5.7+
-- Elasticsearch 7.x+
-- Milvus 2.x+
-- 足够的磁盘空间用于存储PDF文件和生成的数据
+### 元数据治理三层体系
 
-### 2. 安装依赖
-
-```bash
-pip install -r requirements.txt
+```
+Layer 1 — reconcile_meta.py (ES安克卫士)
+  ES 中有数据的文档永不回退上游标志
+  
+Layer 2 — sync_text_metadata.py (merge前的最后一公里)
+  step5 执行前同步 text.json→meta.json，消除过时标志
+  
+Layer 3 — rebuild_manifest.py (双向交叉校验)
+  manifest→ES/Milvus 正向 + ES/Milvus→manifest 反向
 ```
 
-### 3. 配置数据库
+### 标志位状态推导规则
 
-编辑 `db_config.py` 文件,配置您的数据库连接信息:
-- MySQL数据库密码
-- Elasticsearch密码
-- Milvus向量数据库密码
+| 你要知道的 | 等价条件 | 复杂度 |
+|-----------|---------|--------|
+| step1-5 全部完成 | meta.json 中 merge_done=true **且** GATE1=pass | O(1) |
+| 全链路成功(ES入库) | elasticsearch_database_done=true **且** GATE2=pass | O(1) |
+| 全链路成功(Milvus) | vector_database_done=true | O(1) |
+| step5 之前全部完成 | GATE1=pass（等价推导） | O(1) |
 
-### 4. 配置API密钥
+---
 
-编辑 `model_config.py` 文件,配置您的AI模型API密钥:
-- DeepSeek API密钥
-- 智谱AI API密钥
-- 阿里云通义千问API密钥
+## 📂 数据产出结构
 
+```
+announcement_document_processing_local/
+├── processed_files_local.json          # 主 manifest
+├── {fund_code}/                        # 如 180101/, 508066/
+│   └── {pdf_name}/                     # 180101-xxx-2021-05-20
+│       ├── meta.json                   # 处理标志位（权威真相）
+│       ├── text.json                   # 提取/合并后的全文（含 metadata）
+│       ├── table_describe.json         # LLM 表格描述（每页/跨页一行）
+│       ├── not_table_describe.json     # LLM 非表页描述
+│       ├── temp_pdf_images/            # [GATE1后删除] 中间产物 — PDF 渲染 PNG
+│       └── table_image/                # [GATE1后删除] 中间产物 — 检测到的表格裁图
+│
+└── manifest_backups/                   # manifest 时间戳快照
 
-### 5. 配置文件路径
+# 最终检索数据（外部系统）
+ES:  http://localhost:9200/reits_docs       ← 165 万 chunks（全文检索）
+Milvus: http://localhost:19530/reits_embeddings ← 110 万 vectors（语义检索）
+MySQL: announcement.page_data                ← 逐页结构化数据
+```
 
-编辑 `file_paths_config.py` 文件,设置PDF输入路径和输出路径。
+### 关键标志位（meta.json）
+
+```json
+{
+  "text_extracted": true,           // step1+step2 完成
+  "table_detection_vector_done": true,  // step3.1
+  "table_detection_scan_done": true,    // step3.2
+  "table_describe_done": true,      // step4.1.1
+  "not_table_describe_done": true,  // step4.2.1
+  "merge_done": true,               // step5 + GATE1 pass
+  "text_segmentation": true,        // step6
+  "embedding_done": true,           // step7
+  "elasticsearch_database_done": true,  // step8.1 + GATE2 pass
+  "vector_database_done": true      // step8.2
+}
+```
+
+> ⚠️ **信任链方向**: 物理数据(ES/Milvus/磁盘文件) > meta.json。meta.json 是**线索**不是**真相**，可能假阳性或假阴性。判断文档状态时以 ES/Milvus 实际入库数据为准。
+
+---
 
 ## 🚀 使用方法
 
-### 完整流程运行
+### 环境要求
+- Python 3.11+ (conda env: `deepseek-ocr`)
+- MySQL 5.7+
+- Elasticsearch 7.x+
+- Milvus 2.x+
+- Docker (ES + Milvus)
+- 足够的磁盘空间（完整处理 1,425 份 PDF 需 ~300GB）
 
-按顺序执行以下脚本:
+### 安装
 
 ```bash
-# 步骤1: 处理PDF
-python step1_process_pdfs.py
+# 1. 克隆仓库
+git clone https://github.com/pwu0125/RAG-REITsTextFlow.git
+cd RAG-REITsTextFlow
 
-# 步骤2: 提取文本
-python step2_extract_text_onlyvactor_multi_process.py
+# 2. 创建 conda 环境
+conda create -n deepseek-ocr python=3.11
+conda activate deepseek-ocr
 
-# 步骤3: 检测表格
-python step3_1_detection_vactor_multi_process.py
-python step3_2_table_detection_scan_multifile.py
+# 3. 安装依赖
+pip install -r requirements.txt
 
-# 步骤4: 生成图像描述
-python step4_1_1_describe_table_images_multi_thread.py
-python step4_1_2_describe_table_images_multi_thread_second.py
-python step4_2_1_describe_not_table_images_llm.py
-python step4_2_2_describe_not_table_images_llm_second.py
+# 4. 配置（复制模板后编辑）
+cp db_config.example.py db_config.py   # 数据库密码
+# 编辑 model_config.py                 # API 密钥
 
-# 步骤5: 合并文本
-python step5_merge_table_into_text.py
+# 5. 创建数据库索引
+python create_elasticsearch_index.py
+python create_vector_database.py
 
-# 步骤6: 文本分割
-python step6_text_segmentation.py
-
-# 步骤7: 生成向量
-python step7_text_embedding.py
-
-# 步骤8: 存储数据
-python step8_1_ingest_elasticsearch_data.py
-python step8_2_ingest_vector_database.py
+# 6. 下载 TableTransformer 模型
+# (下载到 table-transformer-detection/ 目录，参见 SETUP.md)
 ```
 
-## 📧 联系方式
+### 运行管道
 
-如有问题或建议,请联系: 412447958@qq.com
+```bash
+# 全新运行一个批次
+python pipeline_controller.py B2m
 
+# 从崩溃恢复
+python pipeline_controller.py B2m --resume
+
+# 运行单步
+python run_step.py B2m step5
+
+# 运行 GATE 检查
+python gate1_coverage_check.py B2m
+python gate2_accuracy_check.py B2m
+
+# 诊断
+python diagnose_pipeline.py           # 全管道状态
+python scan_progress.py               # 批次进度
+```
+
+### 添加新 PDF
+
+```bash
+# 1. 将 PDF 放入 announcement_document_raw/
+cp your_file.pdf announcement_document_raw/
+
+# 2. 更新 BATCH_CONFIG.json (如果使用新 fund_code)
+# 3. 运行管道
+python pipeline_controller.py <batch_name>
+```
+
+---
+
+## 🐛 已知问题 / Pitfalls
+
+| 问题 | 影响 | 修复方案 |
+|------|------|----------|
+| CC(claude -p) MCP 进程组清理杀子进程 | 管道步骤通过 CC 运行会被 kill | 只能用 conda python 直接运行或 cron job |
+| macOS TesseractNotFoundError 继承 OSError | step3_2 误判 Tesseract 未安装 | ✅ 已修复 |
+| step5 删图后无法追溯中间产物 | 管道断点后无法定位根因 | ✅ GATE1 通过才删图 |
+| meta.json 假阳性/假阴性 | 盲目信任标志位导致误判 | ✅ ES/Milvus 锚定 + reconcile_meta |
+| 零图 PDF 不标记 not_table_describe_done | 纯矢量文档卡在 step4→step5 | ✅ 已修复 |
+
+---
+
+## 📄 License
+
+MIT License. 原始版权归属 [adennng/RAG-REITsTextFlow](https://github.com/adennng/RAG-REITsTextFlow)。修改部分 © 2026 pwu0125。

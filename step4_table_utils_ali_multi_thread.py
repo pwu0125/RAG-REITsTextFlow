@@ -2,14 +2,114 @@
 # 调用大模型进行图片描述——DashScope SDK
 import base64
 import os
-import sys
+import random
+import ssl
 import time
 import dashscope
+from openai import OpenAI
 from model_config import MODEL_CONFIG  # 引入配置文件
 
 # 默认的大模型厂商和模型名称
 DEFAULT_VENDOR = "ali"
-DEFAULT_MODEL_NAME = "qwen-vl-max-2025-01-25"
+DEFAULT_MODEL_NAME = "qwen-vl-ocr-latest"
+
+# ── 瞬态/永久错误分类 ──────────────────────────────
+_TRANSIENT_ERROR_TYPES = {
+    "BrokenPipeError", "TimeoutError", "ConnectionError", "ConnectionResetError",
+    "ConnectionRefusedError", "ConnectionAbortedError",
+    "RemoteDisconnected", "ChunkedEncodingError", "SSLError",
+    "ProxyError", "ProtocolError", "ReadTimeoutError", "ConnectTimeoutError",
+    "ReadTimeout", "ConnectTimeout", "RemoteProtocolError",
+}
+
+_PERMANENT_ERROR_MSG_PATTERNS = [
+    "InvalidApiKey", "invalid_api_key",
+    "401", "403", "404",
+    "image decode", "decode error", "invalid image",
+]
+
+
+def _is_transient_error(e: Exception) -> bool:
+    """Check if an exception is transient (should be retried) vs permanent (should abort)."""
+    type_name = type(e).__name__
+    if type_name in _TRANSIENT_ERROR_TYPES:
+        return True
+    msg = str(e).lower()
+    for pat in ["response ended prematurely", "broken pipe", "connection reset",
+                 "timed out", "timeout", "remote disconnected", "chunked"]:
+        if pat in msg:
+            return True
+    for pat in _PERMANENT_ERROR_MSG_PATTERNS:
+        if pat.lower() in msg:
+            return False
+    if isinstance(e, (ValueError, KeyError)):
+        return False
+    return True
+
+
+def _load_env_file(env_path: str):
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and ((k not in os.environ) or (not os.environ.get(k))):
+                    os.environ[k] = v
+    except Exception:
+        return
+
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+_load_env_file(os.path.join(project_root, ".env"))
+
+# ── OCR 路由器集成 ──────────────────────────────
+# 支持 OCR_BACKEND=local|api|auto 环境变量切换后端
+_ROUTER = None
+
+def _get_router():
+    """懒加载 OCR 路由器"""
+    global _ROUTER
+    if _ROUTER is None:
+        try:
+            from ocr_router import OCRRouter
+            _ROUTER = OCRRouter(mode="auto")
+        except ImportError:
+            pass
+    return _ROUTER
+
+def _is_local_mode() -> bool:
+    """检查是否应使用本地 OCR"""
+    backend = os.environ.get("OCR_BACKEND", "api")
+    return backend == "local"
+
+# ─────────────────────────────────────────────────
+
+
+def ocr_with_router(image_path: str, vendor: str = DEFAULT_VENDOR, model_name: str = DEFAULT_MODEL_NAME, retries: int = 3, delay: int = 5) -> str:
+    """
+    根据 OCR_BACKEND 环境变量路由到本地或 API OCR。
+    用法：直接替换原有 generate_table_description 调用。
+    
+    环境变量:
+      OCR_BACKEND=local   → 使用本地 DeepSeek OCR 2 (MPS)，忽略 vendor/model_name
+      OCR_BACKEND=api     → 使用阿里云 API（默认行为）
+      OCR_BACKEND=auto    → 自动判断（保留，暂未实现批量感知）
+    """
+    backend = os.environ.get("OCR_BACKEND", "api")
+    if backend == "local":
+        router = _get_router()
+        if router is None:
+            raise RuntimeError("OCR_BACKEND=local but ocr_router module not available")
+        return router.ocr(image_path, page_type="table")
+    else:
+        # 默认走原有 API 路径
+        return generate_table_description(image_path, vendor, model_name, retries, delay)
 
 
 def get_model_config(vendor: str, model_name: str) -> dict:
@@ -21,20 +121,34 @@ def get_model_config(vendor: str, model_name: str) -> dict:
     """
     if vendor not in MODEL_CONFIG:
         raise ValueError(f"厂商 {vendor} 不存在于配置文件中。")
-    
+
     vendor_config = MODEL_CONFIG[vendor]
-    
     if model_name not in vendor_config:
         raise ValueError(f"模型 {model_name} 不存在于厂商 {vendor} 的配置中。")
-    
-    return vendor_config[model_name]
+
+    cfg = dict(vendor_config[model_name])
+    if vendor == "ali":
+        env_key = (os.environ.get("ALI_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")).strip()
+        env_base = os.environ.get("ALI_BASE_URL", "").strip()
+        if env_key:
+            cfg["api_key"] = env_key
+        if env_base:
+            cfg["base_url"] = env_base
+    elif vendor == "kimi":
+        env_key = os.environ.get("KIMI_API_KEY", "").strip()
+        env_base = os.environ.get("KIMI_BASE_URL", "").strip()
+        if env_key:
+            cfg["api_key"] = env_key
+        if env_base:
+            cfg["base_url"] = env_base
+    return cfg
 
 
 def generate_table_description(
     image_path: str,
     vendor: str = DEFAULT_VENDOR,
     model_name: str = DEFAULT_MODEL_NAME,
-    retries: int = 3,
+    retries: int = 5,
     delay: int = 5
 ) -> str:
     """
@@ -48,6 +162,13 @@ def generate_table_description(
     :param delay: 每次重试间隔秒数
     :return: 表格描述文本
     """
+    # ── 路由检查：如果 OCR_BACKEND=local，直接走本地 OCR ──
+    if os.environ.get("OCR_BACKEND", "") == "local":
+        router = _get_router()
+        if router is not None:
+            return router.ocr(image_path, page_type="table")
+        # fallthrough to API if router not available
+
     # 获取模型配置
     model_config = get_model_config(vendor, model_name)
 
@@ -100,43 +221,86 @@ def generate_table_description(
         }
     ]
 
-    # 重试机制
+    # 重试机制（指数退避 + 错误分类）
     for attempt in range(retries):
-        responses = dashscope.MultiModalConversation.call(
-            api_key=model_config["api_key"],
-            model=model_config["model"],
-            messages=messages,
-            stream=True,
-            incremental_output=True,
-            vl_high_resolution_images=True
-        )
-        full_content = ""
         try:
-            # 遍历流式响应，每个 response 为一个中间结果
-            for response in responses:
-                try:
-                    chunk = response["output"]["choices"][0]["message"].content[0]["text"]
-                    # =============================
-                    # 注释掉原来输出到终端的代码：
-                    # sys.stdout.write(chunk)
-                    # sys.stdout.flush()
-                    # 但仍保留拼接到 full_content
-                    # =============================
-                    full_content += chunk
-                except Exception:
-                    continue
-
-            if full_content:
-                # 注释掉原来刷新输出的代码
-                # sys.stdout.flush()
-                return full_content
+            if vendor == "ali":
+                responses = dashscope.MultiModalConversation.call(
+                    api_key=model_config["api_key"],
+                    model=model_config["model"],
+                    messages=messages,
+                    stream=True,
+                    incremental_output=True,
+                    vl_high_resolution_images=False
+                )
+                full_content = ""
+                for response in responses:
+                    try:
+                        chunk = response["output"]["choices"][0]["message"].content[0]["text"]
+                        full_content += chunk
+                    except Exception:
+                        continue
+                if full_content:
+                    return full_content
+                print(f"\n第 {attempt+1} 次请求未返回有效内容。")
             else:
+                client = OpenAI(api_key=model_config["api_key"], base_url=model_config["base_url"])
+
+                candidates = [model_config["model"]]
+                if vendor == "ali":
+                    for m in ["qwen-vl-ocr-latest"]:
+                        if m not in candidates:
+                            candidates.append(m)
+
+                last_content = ""
+                for model_id in candidates:
+                    response = client.chat.completions.create(
+                        model=model_id,
+                        messages=[{
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+                                {"type": "text", "text": text_prompt}
+                            ]
+                        }],
+                        stream=True,
+                        max_tokens=8192,
+                        temperature=0.3
+                    )
+                    full_content = ""
+                    for chunk in response:
+                        try:
+                            part = chunk.choices[0].delta.content
+                            if part:
+                                full_content += part
+                        except Exception:
+                            continue
+                    
+                    content = full_content.strip()
+                    if content:
+                        # 如果内容比较丰富（大于10个字），直接返回
+                        if len(content) > 10:
+                            return content
+                        # 如果是短内容（如页码），先记下来，如果后面没更好的再返回
+                        last_content = content
+                
+                # 如果所有候选模型都运行完毕，且拿到了短内容，则返回该内容
+                if last_content:
+                    return last_content
+
                 print(f"\n第 {attempt+1} 次请求未返回有效内容。")
         except Exception as e:
-            print(f"\n第 {attempt+1} 次请求异常: {e}")
-        time.sleep(delay)
+            if not _is_transient_error(e):
+                print(f"\n第 {attempt+1} 次请求异常（永久错误，不重试）: {e}")
+                break
+            print(f"\n第 {attempt+1} 次请求异常（瞬态，重试）: {e}")
 
-    raise Exception("DashScope API 多次请求未返回有效流式输出，请稍后重试。")
+        if attempt < retries - 1:
+            sleep_time = delay * (2 ** attempt) + random.uniform(0, 2)
+            print(f"等待 {sleep_time:.1f}s 后重试...")
+            time.sleep(sleep_time)
+
+    return ""
 
 
 if __name__ == "__main__":

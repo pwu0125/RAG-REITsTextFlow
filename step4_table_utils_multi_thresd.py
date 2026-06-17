@@ -13,8 +13,8 @@ TOP_CROP_PIXELS = 300    # 上边距裁剪像素（可调整）
 BOTTOM_CROP_PIXELS = 300 # 下边距裁剪像素（可调整）
 
 # 默认的大模型厂商和模型名称
-DEFAULT_VENDOR = "zhipu"
-DEFAULT_MODEL_NAME = "GLM-4V-Flash"
+DEFAULT_VENDOR = "ali"
+DEFAULT_MODEL_NAME = "qwen-vl-ocr-latest"
 
 def crop_image(image_path: str) -> bytes:
     """

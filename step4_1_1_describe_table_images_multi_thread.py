@@ -13,7 +13,7 @@ import db_config
 from step4_table_utils_ali_multi_thread import generate_table_description  # 调用生成描述的函数
 from step4_compress_image import compress_image  # 调用压缩图片函数
 from file_paths_config import OUTPUT_DIR
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
 
 # 获取脚本所在目录，确保日志文件生成在log目录下
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +33,41 @@ logger.addHandler(file_handler)
 
 # 用于并发写 JSON 文件时加锁，避免多线程竞争
 json_lock = threading.Lock()
+MANIFEST_FILE = os.path.join(OUTPUT_DIR, "processed_files_local.json")
+
+# 读取整数环境变量的助手
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+def _safe_read_json_file(path):
+    """安全读取 JSON 文件，处理编码损坏和格式错误。
+
+    - UnicodeDecodeError: 以 errors='replace' 重新读取后解析
+    - JSONDecodeError: 记录日志，删除损坏文件，重新抛出以便调用方重取
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        logging.warning(f"JSON 文件编码异常 (非 UTF-8 字节): {path}，尝试替换字符重新读取")
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            raw = f.read()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logging.warning(f"JSON 文件编码损坏无法修复: {path}，已删除并等待 API 重新生成")
+            os.remove(path)
+            raise
+    except json.JSONDecodeError:
+        logging.warning(f"JSON 文件格式损坏: {path}，已删除并等待 API 重新生成")
+        os.remove(path)
+        raise
 
 def get_announcement_connection():
     """
@@ -88,6 +123,95 @@ def get_pending_files_from_db():
         logging.error(f"数据库查询失败: {e}")
         raise e
 
+def _safe_read_json(path):
+    try:
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name)
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("table_describe_done") is True:
+            continue
+        vector_done = status.get("table_detection_vector_done")
+        scan_done = status.get("table_detection_scan_done")
+        if vector_done is not True and scan_done is not True:
+            continue
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "table_detection_vector_done": bool(vector_done is True),
+            "table_detection_scan_done": bool(scan_done is True),
+            "table_describe_done": False
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+    for fund_code in grouped_files:
+        grouped_files[fund_code].sort(key=lambda x: x.get("file_name", ""))
+    return grouped_files, False
+
+def update_local_table_describe_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["table_describe_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["table_describe_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    # [BATCH-FIX] manifest write removed — rebuilt by rebuild_manifest.py after step completes
+    return True
+
+
 def parse_page_numbers_from_filename(filename):
     """
     根据图片文件名（如 "page_2.png" 或 "page_2-3.png"）解析出页码信息，返回字符串。
@@ -97,7 +221,7 @@ def parse_page_numbers_from_filename(filename):
         name = name[len("page_"):]
     return name  # 如 "2" 或 "2-3"
 
-def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path):
+def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path, use_db):
     """
     并行处理单张图片的核心逻辑：
       1. 调用 generate_table_description 生成描述，如果失败则尝试压缩后重试
@@ -106,22 +230,53 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path):
       4. 返回 True/False 表示是否成功（若数据库写入失败则直接返回 False）
     """
     image_path = os.path.join(table_img_dir, img_file)
+    # 预压缩大图：>5MB 的 PNG 先压缩再传 API，避免 base64 内存爆炸
+    try:
+        if os.path.getsize(image_path) > 5 * 1024 * 1024:
+            compressed = compress_image(image_path)
+            if compressed and os.path.exists(compressed):
+                image_path = compressed
+    except Exception:
+        pass
     try:
         start_time = time.time()
         description = generate_table_description(image_path)
         elapsed_time = time.time() - start_time
         print(f"图片 {img_file} 生成描述耗时 {elapsed_time:.2f} 秒。")
     except Exception as e:
-        # 捕获各种失败，但都不要立刻 return，让它继续走到"压缩重试"。
-        if isinstance(e, ConnectionResetError):
-            print(f"图片 {img_file} 描述生成失败: 远程连接被重置，尝试压缩后重试。")
-        elif "Read timed out" in str(e):
-            print(f"图片 {img_file} 描述生成失败: 请求超时，尝试压缩后重试。")
-        elif "DashScope API 多次请求未返回有效流式输出" in str(e):
-            print(f"图片 {img_file} 描述生成失败: DashScope API 请求失败，尝试压缩后重试。")
-        else:
-            msg = f"图片 {img_file} 描述生成失败: {e}"
-            print(msg)
+        # ═══ Fix 3: transient error retry with backoff ═══
+        transient_types = (BrokenPipeError, TimeoutError, ConnectionError,
+                          ConnectionResetError, OSError)
+        is_transient = isinstance(e, transient_types) or \
+                       any(kw in str(e) for kw in ('Read timed out', 'RemoteDisconnected', 'Connection reset'))
+        
+        if is_transient:
+            for retry_n in range(3):
+                wait = 2 * (2 ** retry_n)
+                print(f"图片 {img_file} 瞬态错误({type(e).__name__})，重试 {retry_n+1}/3，等待 {wait}s")
+                time.sleep(wait)
+                try:
+                    description = generate_table_description(image_path)
+                    print(f"图片 {img_file} 重试成功。")
+                    break
+                except Exception as e2:
+                    if retry_n == 2:
+                        print(f"图片 {img_file} 3次重试全部失败: {e2}")
+                    continue
+            else:
+                # All retries failed → fall through to compress retry
+                pass
+        if 'description' not in dir():
+            # Still failed — let existing compress-retry handle it
+            if isinstance(e, ConnectionResetError):
+                print(f"图片 {img_file} 描述生成失败: 远程连接被重置，尝试压缩后重试。")
+            elif "Read timed out" in str(e):
+                print(f"图片 {img_file} 描述生成失败: 请求超时，尝试压缩后重试。")
+            elif "DashScope API 多次请求未返回有效流式输出" in str(e):
+                print(f"图片 {img_file} 描述生成失败: DashScope API 请求失败，尝试压缩后重试。")
+            else:
+                msg = f"图片 {img_file} 描述生成失败: {e}"
+                print(msg)
             #logging.warning(msg)
         try:
             # 压缩后重试
@@ -140,8 +295,16 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path):
             #logging.warning(msg)
             return False  # 不写 JSON，也不更新数据库
 
+    # 清洗描述文本，确保为合法 UTF-8 字符串，避免 JSON 序列化时崩溃
+    if description:
+        description = description.encode("utf-8", errors="replace").decode("utf-8")
+    if not isinstance(description, str) or not description.strip():
+        print(f"图片 {img_file} 描述为空或无效，跳过。")
+        return False
+
     # 构造记录
     page_info = parse_page_numbers_from_filename(img_file)
+    source_file = os.path.basename(pdf_info.get("file_path", "")) or pdf_info.get("file_name", "")
     record = {
         "page_num": page_info,
         "picture_path": image_path,
@@ -149,50 +312,50 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path):
         "fund_code": pdf_info.get("fund_code"),
         "short_name": pdf_info.get("short_name"),
         "announcement_title": pdf_info.get("announcement_title"),
-        "source_file": os.path.basename(pdf_info.get("file_path")),
+        "source_file": source_file,
         "description": description
     }
 
-    # 先将记录插入或更新至数据库中的 table_describe 表
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            INSERT INTO table_describe 
-            (fund_code, short_name, announcement_title, source_file, page_num, picture_path, file_path, description)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                fund_code = VALUES(fund_code),
-                short_name = VALUES(short_name),
-                announcement_title = VALUES(announcement_title),
-                picture_path = VALUES(picture_path),
-                file_path = VALUES(file_path),
-                description = VALUES(description)
-            """
-            params = (
-                record["fund_code"],
-                record["short_name"],
-                record["announcement_title"],
-                record["source_file"],
-                record["page_num"],
-                record["picture_path"],
-                record["file_path"],
-                record["description"]
-            )
-            cursor.execute(sql, params)
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        msg = f"图片 {img_file} 插入数据库失败: {e}"
-        print(msg)
-        logging.warning(msg)
-        return False
+    if use_db:
+        try:
+            conn = get_announcement_connection()
+            with conn.cursor() as cursor:
+                sql = """
+                INSERT INTO table_describe 
+                (fund_code, short_name, announcement_title, source_file, page_num, picture_path, file_path, description)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    fund_code = VALUES(fund_code),
+                    short_name = VALUES(short_name),
+                    announcement_title = VALUES(announcement_title),
+                    picture_path = VALUES(picture_path),
+                    file_path = VALUES(file_path),
+                    description = VALUES(description)
+                """
+                params = (
+                    record["fund_code"],
+                    record["short_name"],
+                    record["announcement_title"],
+                    record["source_file"],
+                    record["page_num"],
+                    record["picture_path"],
+                    record["file_path"],
+                    record["description"]
+                )
+                cursor.execute(sql, params)
+                conn.commit()
+            conn.close()
+        except Exception as e:
+            msg = f"图片 {img_file} 插入数据库失败: {e}"
+            print(msg)
+            logging.warning(msg)
+            return False
 
-    # 数据库写入成功后，立即更新 JSON 文件
     with json_lock:
         if os.path.exists(describe_json_path):
-            with open(describe_json_path, 'r', encoding='utf-8') as f:
-                table_descriptions = json.load(f)
+            table_descriptions = _safe_read_json_file(describe_json_path)
+            if table_descriptions is None:
+                table_descriptions = {}
         else:
             table_descriptions = {}
         table_descriptions[img_file] = record
@@ -200,30 +363,24 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path):
     print(f"图片 {img_file} 已写入描述文件。")
     return True
 
-def process_pdf_table_descriptions(pdf_info, max_workers=15):
+def process_pdf_table_descriptions(pdf_info, max_workers=15, use_db=True, progress_secs=30, api_semaphore=None):
     """
     并行处理单个 PDF 文件的所有尚未描述的表格图片：
       1. 查找该 PDF 文件夹下的 table_image 文件夹
       2. 对每张未处理的图片调用 process_single_image
       3. 如果所有图片均成功，则返回 True；若任意图片处理失败则返回 False
     """
-    pdf_filename = os.path.basename(pdf_info["file_path"])
+    pdf_filename = os.path.basename(pdf_info.get("file_path", "")) or pdf_info.get("file_name", "")
     pdf_folder_name = os.path.splitext(pdf_filename)[0]
 
-    # 根据 fund_code 寻找对应基金文件夹
     fund_code = pdf_info.get("fund_code", "")
-    fund_folder = None
-    for folder in os.listdir(OUTPUT_DIR):
-        if folder.startswith(fund_code):
-            fund_folder = folder
-            break
-    if not fund_folder:
+    if not fund_code:
         msg = f"未找到基金文件夹，基金代码: {fund_code}，跳过 {pdf_filename}"
         print(msg)
         logging.warning(msg)
         return False
 
-    pdf_folder_path = os.path.join(OUTPUT_DIR, fund_folder, pdf_folder_name)
+    pdf_folder_path = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name)
     if not os.path.exists(pdf_folder_path):
         msg = f"未找到PDF文件夹: {pdf_folder_path}，跳过 {pdf_filename}"
         print(msg)
@@ -242,8 +399,9 @@ def process_pdf_table_descriptions(pdf_info, max_workers=15):
 
     # 读取已处理的图片记录
     if os.path.exists(describe_json_path):
-        with open(describe_json_path, 'r', encoding='utf-8') as f:
-            table_descriptions = json.load(f)
+        table_descriptions = _safe_read_json_file(describe_json_path)
+        if table_descriptions is None:
+            table_descriptions = {}
     else:
         table_descriptions = {}
 
@@ -261,20 +419,51 @@ def process_pdf_table_descriptions(pdf_info, max_workers=15):
         return True
     print(f"有 {len(to_process)} 张图片需要并行处理...")
 
-    # 并行处理
+    # 并行处理 + 进度心跳
     all_images_success = True
+
+    progress_lock = threading.Lock()
+    progress = {"start_ts": time.time(), "total": len(to_process), "done": 0, "failed": 0}
+    stop_event = threading.Event()
+
+    def _heartbeat():
+        while not stop_event.wait(max(1, int(progress_secs))):
+            with progress_lock:
+                done = progress["done"]; total = progress["total"]; failed = progress["failed"]
+                elapsed = time.time() - progress["start_ts"]
+            print(f"{pdf_folder_name} 进度: {done}/{total}，失败: {failed}，已用时: {elapsed:.0f}s")
+
+    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    hb_thread.start()
+
+    # Semaphore 限流：限制单PDF同时只有3个 DashScope API 调用（最优=3, RPM<2%）
+    _semaphore = api_semaphore or threading.Semaphore(3)
+
+    def _throttled_process_single_image(img_file, table_img_dir, pdf_info, describe_json_path, use_db):
+        _semaphore.acquire()
+        try:
+            return process_single_image(img_file, table_img_dir, pdf_info, describe_json_path, use_db)
+        finally:
+            _semaphore.release()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                process_single_image, img_file, table_img_dir, pdf_info, describe_json_path
+                _throttled_process_single_image, img_file, table_img_dir, pdf_info, describe_json_path, use_db
             ): img_file
             for img_file in to_process
         }
         for future in as_completed(futures):
             img_name = futures[future]
             success = future.result()
+            with progress_lock:
+                progress["done"] += 1
+                if not success:
+                    progress["failed"] += 1
             if not success:
                 all_images_success = False
+
+    stop_event.set()
 
     if all_images_success:
         print(f"完成 {pdf_folder_name} 的表格描述（并行处理）。")
@@ -283,14 +472,14 @@ def process_pdf_table_descriptions(pdf_info, max_workers=15):
     return all_images_success
 
 def main():
-    try:
-        # 从数据库获取待处理文件
-        processed_files = get_pending_files_from_db()
-    except Exception as e:
-        error_msg = f"从数据库获取待处理文件失败: {e}"
-        print(error_msg)
-        logging.error(error_msg)
-        return
+    processed_files, use_db = get_pending_files()
+    max_workers = _get_env_int("TABLE_DESC_MAX_WORKERS", 2)
+    progress_secs = _get_env_int("TABLE_DESC_PROGRESS_SECS", 30)
+    print(f"并发线程数: {max_workers}，进度心跳: {progress_secs}s")
+    logging.info(f"max_workers={max_workers}, progress_secs={progress_secs}")
+
+    # 全局速率限制：跨PDF总并发 DashScope 调用 ≤ 4
+    global_api_semaphore = threading.Semaphore(3)  # 降低到3避免内存压力
 
     # 收集待处理PDF
     files_to_process = []
@@ -301,8 +490,8 @@ def main():
         msg = "没有找到需要处理的文件。"
         print(msg)
         logging.warning(msg)
-        print("表格图片描述全部完成！描述信息已写进数据库。")
-        logging.warning("表格图片描述全部完成！描述信息已写进数据库。")
+        print("表格图片描述全部完成！描述信息已写入本地文件。")
+        logging.warning("表格图片描述全部完成！描述信息已写入本地文件。")
         return
 
     total_files = len(files_to_process)
@@ -317,25 +506,25 @@ def main():
         file_name = pdf_info.get("file_name")
         print(f"\n----- 正在处理第 {idx}/{total_files} 个文件: {file_name} -----")
         logging.info(f"开始处理文件: {file_name}")
-        success = process_pdf_table_descriptions(pdf_info, max_workers=15)
+        success = process_pdf_table_descriptions(
+            pdf_info,
+            max_workers=max_workers,
+            use_db=use_db,
+            progress_secs=progress_secs,
+            api_semaphore=global_api_semaphore
+        )
         if success:
-            # 只更新数据库 processed_files 表
-            try:
-                conn = get_announcement_connection()
-                with conn.cursor() as cursor:
-                    sql = "UPDATE processed_files SET table_describe_done = %s WHERE file_name = %s"
-                    cursor.execute(sql, ("true", file_name))
-                    conn.commit()
-                conn.close()
-                msg = f"已更新 {file_name} 状态为 table_describe_done=True。"
+            ok = update_local_table_describe_done(pdf_info)
+            if ok:
+                msg = f"已更新本地状态 {file_name} 的 table_describe_done=True。"
                 print(msg)
                 logging.info(msg)
                 processed_count += 1
-            except Exception as e:
-                msg = f"文件 {file_name} 更新数据库 processed_files 失败: {e}"
+            else:
+                msg = f"文件 {file_name} 更新本地状态失败。"
                 print(msg)
                 logging.warning(msg)
-                failed_files.append((file_name, f"更新数据库 processed_files 失败: {e}"))
+                failed_files.append((file_name, "更新本地状态失败"))
         else:
             msg = f"{file_name} 处理表格描述失败。"
             print(msg)
@@ -358,7 +547,7 @@ def main():
         print(fail_msg)
         logging.warning(fail_msg)
 
-    final_msg = "表格图片描述全部完成！描述信息已写进数据库。"
+    final_msg = "表格图片描述全部完成！描述信息已写入本地文件。"
     print(f"\n{final_msg}")
     logging.warning(final_msg)
 

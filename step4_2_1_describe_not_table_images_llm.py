@@ -5,13 +5,15 @@ import time
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-import pymysql
-import db_config
 
-from step4_table_utils_multi_thresd import generate_table_description  # 调用生成描述的函数
+from step4_table_utils_ali_multi_thread import generate_table_description  # 调用生成描述的函数（默认 Qwen）
 from step4_compress_image import compress_image  # 调用压缩图片函数
 from file_paths_config import OUTPUT_DIR
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
+
+# 用于并发写 JSON 文件时加锁，避免多线程竞争
+json_lock = threading.Lock()
+MANIFEST_FILE = os.path.join(OUTPUT_DIR, "processed_files_local.json")
 
 # 配置参数
 MAX_THREADS = 3  # 最大线程数
@@ -55,59 +57,108 @@ else:
     logger.addHandler(file_handler)
 # ==========================================
 
-def get_announcement_connection():
-    """
-    获取数据库 announcement 的连接
-    """
-    config = db_config.get_db_announcement_config()
-    return pymysql.connect(
-        host=config["host"],
-        port=config["port"],
-        user=config["user"],
-        password=config["password"],
-        database=config["database"],
-        charset=config["charset"],
-        cursorclass=pymysql.cursors.DictCursor
-    )
-
-def get_pending_files_from_db():
-    """
-    从数据库获取需要进行非表格图片描述的文件
-    条件: text_extracted='true' AND table_detection_scan_done='true' 
-          AND not_table_describe_done='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
+def _safe_read_json(path):
     try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-                   doc_type_1, doc_type_2, announcement_link, text_extracted,
-                   table_detection_scan_done, not_table_describe_done
-            FROM processed_files 
-            WHERE text_extracted='true' 
-              AND table_detection_scan_done='true' 
-              AND not_table_describe_done='false' 
-              AND doc_type_1 != '无关'
-            ORDER BY fund_code, file_name
-            """
-            cursor.execute(sql)
-            results = cursor.fetchall()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
-    except Exception as e:
-        logging.error(f"数据库查询失败: {e}")
-        raise e
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("not_table_describe_done") is True:
+            continue
+        if status.get("text_extracted") is not True:
+            continue
+        if status.get("table_detection_scan_done") is not True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "text_extracted": True,
+            "table_detection_scan_done": True,
+            "not_table_describe_done": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fund_code in grouped_files:
+        grouped_files[fund_code].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_not_table_describe_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["not_table_describe_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["not_table_describe_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    # [BATCH-FIX] manifest write removed — rebuilt by rebuild_manifest.py after step completes
+    return True
+
+
+def get_pending_files():
+    return get_pending_files_from_local(), False
 
 def parse_page_numbers_from_filename(filename):
     """
@@ -173,6 +224,11 @@ def process_pdf_not_table_descriptions(pdf_info):
 
     print(f"在 {pdf_folder_name} 中找到 {len(img_files)} 个非表格图片。")
 
+    # ═══ Fix 1: 0 非表格图 — 直接标记完成 ═══
+    if len(img_files) == 0:
+        print(f"{pdf_folder_name}: 0 非表格图，标记 not_table_describe_done=True")
+        return True
+
     all_images_success = True  # 标记是否所有图片均成功生成描述
 
     # 统一 json 文件名与 step2 保持一致
@@ -197,7 +253,7 @@ def process_pdf_not_table_descriptions(pdf_info):
         description = None
         try:
             start_time = time.time()
-            description = generate_table_description(image_path)
+            description = generate_table_description(image_path, vendor="ali", model_name="qwen-vl-ocr-latest")
             elapsed_time = time.time() - start_time
             print(f"生成描述耗时 {elapsed_time:.2f} 秒。")
         except Exception as e:
@@ -210,7 +266,7 @@ def process_pdf_not_table_descriptions(pdf_info):
                     compressed_path = image_path
                 print(f"使用压缩图片: {compressed_path} 重新生成描述...")
                 start_time = time.time()
-                description = generate_table_description(compressed_path)
+                description = generate_table_description(compressed_path, vendor="ali", model_name="qwen-vl-ocr-latest")
                 elapsed_time = time.time() - start_time
                 print(f"压缩后图片生成描述耗时 {elapsed_time:.2f} 秒。")
                 image_path = compressed_path
@@ -292,22 +348,16 @@ def process_single_pdf(pdf_info, lock):
     success = process_pdf_not_table_descriptions(pdf_info)
 
     if success:
-        # 只更新数据库 processed_files 表
-        try:
-            conn = get_announcement_connection()
-            with conn.cursor() as cursor:
-                sql = "UPDATE processed_files SET not_table_describe_done = %s WHERE file_name = %s"
-                cursor.execute(sql, ("true", file_name))
-                conn.commit()
-            conn.close()
-            msg = f"已更新 {file_name} 状态为 not_table_describe_done=True。"
+        with json_lock:
+            ok = update_local_not_table_describe_done(pdf_info)
+        if ok:
+            msg = f"已更新 {file_name} 状态为 not_table_describe_done=True（本地）。"
             print(msg)
             return True
-        except Exception as e:
-            msg = f"文件 {file_name} 更新数据库 processed_files 失败: {e}"
-            print(msg)
-            logger.warning(msg)
-            return False
+        msg = f"文件 {file_name} 更新本地状态失败。"
+        print(msg)
+        logger.warning(msg)
+        return False
     else:
         msg = f"{file_name} 处理非表格图片描述失败。"
         print(msg)
@@ -315,14 +365,8 @@ def process_single_pdf(pdf_info, lock):
         return False
 
 def main():
-    try:
-        # 从数据库获取待处理文件
-        processed_files = get_pending_files_from_db()
-    except Exception as e:
-        error_msg = f"从数据库获取待处理文件失败: {e}"
-        print(error_msg)
-        logger.error(error_msg)
-        return
+    # 从本地 processed_files_local.json 获取待处理文件
+    processed_files = get_pending_files_from_local()
 
     # 收集待处理PDF（数据库查询已经包含了所有筛选条件）
     files_to_process = []

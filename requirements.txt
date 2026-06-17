@@ -1,26 +1,72 @@
-# PDF处理
-PyMuPDF>=1.23.0  # fitz
-pdfplumber>=0.10.0
-pdf2image>=1.16.0
+# ═══════════════════════════════════════════════════════════
+# RAG-REITsTextFlow — Python 依赖
+# ═══════════════════════════════════════════════════════════
+# 安装: pip install -r requirements.txt
+# 完整冻结版本（精确复现）: requirements-frozen.txt
+# ═══════════════════════════════════════════════════════════
+
+# PDF 处理
+PyMuPDF>=1.27.0         # fitz — PDF 渲染
+pdfplumber>=0.11.0      # 矢量 PDF 文本/表格提取
+pdf2image>=1.17.0       # PDF → PNG 转换
+pypdf>=6.0.0            # PDF 元数据读取
+pdfminer.six>=20251200  # PDF 底层解析
 
 # 数据库
-pymysql>=1.1.0
-elasticsearch>=8.0.0
-pymilvus>=2.3.0
+pymysql>=1.1.0          # MySQL 连接
+elasticsearch>=8.19.0   # Elasticsearch 全文检索
+pymilvus>=3.0.0         # Milvus 向量数据库
 
 # 图像处理
-opencv-python>=4.8.0  # cv2
-Pillow>=10.0.0
-pytesseract>=0.3.10
-paddleocr>=2.7.0
+opencv-python>=4.13.0   # cv2 — 图像预处理
+Pillow>=12.0.0          # PIL — 图像操控
+pytesseract>=0.3.13     # OCR (需独立安装 tesseract)
+scikit-image>=0.23.0    # 图像分析工具
 
-# AI模型API
-openai>=1.0.0
-dashscope>=1.14.0  # 阿里云通义千问
+# AI / LLM API
+openai>=2.40.0          # OpenAI 兼容 API
+dashscope>=1.25.0       # 阿里通义千问 API
+
+# 深度学习 (TableTransformer 等)
+torch>=2.12.0           # PyTorch
+torchvision>=0.27.0     # torchvision
+transformers>=4.45.0    # HuggingFace Transformers
+safetensors>=0.7.0     # 模型权重安全加载
+accelerate>=1.13.0      # HF 加速
+huggingface_hub>=0.36.0 # HF 模型下载
 
 # 数据处理
-numpy>=1.24.0
-regex>=2023.0.0
+numpy>=1.26.0           # 数值计算
+pandas>=3.0.0           # 结构化数据
+scipy>=1.17.0           # 科学计算
+scikit-learn>=1.6.0     # 机器学习工具
+regex>=2026.0.0         # 增强正则
+jieba>=0.42.0           # 中文分词
 
-# 工具库
-# 标准库: base64, datetime, json, logging, math, os, re, shutil, sys, io, threading, concurrent
+# 文本嵌入
+tiktoken>=0.13.0        # OpenAI tokenizer
+sentencepiece>=0.2.0    # 多语言 tokenizer
+
+# 网络/HTTP
+requests>=2.34.0        # HTTP 客户端
+httpx>=0.28.0           # 异步 HTTP
+aiohttp>=3.14.0         # 异步 HTTP 客户端
+
+# 实用工具
+tqdm>=4.67.0            # 进度条
+python-dotenv>=1.2.0    # .env 配置
+PyYAML>=6.0.0           # YAML 解析
+click>=8.4.0            # CLI 工具
+rich>=15.0.0            # 终端美化输出
+matplotlib>=3.10.0      # 可视化（诊断用）
+plotly>=6.7.0           # 交互可视化
+
+# 序列化
+orjson>=3.11.0          # 高性能 JSON
+
+# 模型注册
+modelscope>=1.37.0      # ModelScope 模型下载
+
+# 系统
+psutil>=7.2.0           # 系统资源监控
+python-multipart>=0.0.6 # 多部分表单解析

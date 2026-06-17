@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import cv2
 import numpy as np
 import os
@@ -55,9 +56,14 @@ class CrossPageTableDetector:
     # --------------------------
     def load_image(self, path):
         """支持中文路径的图像加载"""
-        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        norm_path = os.path.normpath(str(path).replace('\\', os.sep))
+        if "***" in norm_path:
+            raise ValueError(f"路径包含占位符***，请替换为真实路径: {norm_path}")
+        if not os.path.exists(norm_path):
+            raise FileNotFoundError(f"文件不存在: {norm_path}")
+        img = cv2.imdecode(np.fromfile(norm_path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError(f"图像加载失败: {path}")
+            raise ValueError(f"图像加载失败: {norm_path}")
         return img
 
     def preprocess_image(self, img):
@@ -302,9 +308,6 @@ class CrossPageTableDetector:
             print("判定结果：不存在跨页表格")
         print("="*40)
 
-        return result
-    
-            # 确保所有数值类型可序列化
         return {
             'is_cross_page': bool(result['is_cross_page']),
             'reason': str(result['reason']) if result['reason'] else None,
@@ -316,13 +319,11 @@ class CrossPageTableDetector:
 # 使用示例
 # ======================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("prev_path")
+    parser.add_argument("next_path")
+    args = parser.parse_args()
+
     detector = CrossPageTableDetector()
-    
-    # 执行检测
-    result = detector.check_cross_page(
-        "***/508084.SH_汇添富九州通医药REIT\\2025-02-18_508084.SH_汇添富九州通医药REIT_汇添富九州通医药仓储物流封闭式基础设施证券投资基金基金合同生效公告\\table_image\\page_2.png",
-        "***/508084.SH_汇添富九州通医药REIT\\2025-02-18_508084.SH_汇添富九州通医药REIT_汇添富九州通医药仓储物流封闭式基础设施证券投资基金基金合同生效公告\\table_image\\page_3-4.png"
-    )
+    result = detector.check_cross_page(args.prev_path, args.next_path)
     print(f"\n检测结果：{result}")
-    print(type(result['horizontal_distance']))  # 应显示<class 'int'>
-    print(type(result['vertical_avg_diff']))    # 应显示<class 'float'>

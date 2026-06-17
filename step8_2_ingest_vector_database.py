@@ -16,17 +16,18 @@ import os
 import time
 import json
 import logging
-import pymysql
+import threading
 from typing import List
-from datetime import date as DateObj
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from db_config import get_db_announcement_config, get_vector_db_config
+from db_config import get_vector_db_config
 import file_paths_config
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
 from pymilvus import connections, Collection, utility
 
 MULTIFILE_OUTPUT_DIR = file_paths_config.OUTPUT_DIR
+MANIFEST_FILE = os.path.join(MULTIFILE_OUTPUT_DIR, "processed_files_local.json")
+json_lock = threading.Lock()
 
 COLLECTION_NAME = "reits_announcement"
 # 获取脚本所在目录，确保日志文件生成在log目录下
@@ -44,159 +45,205 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 # 可调最大并发线程数
-MAX_WORKERS = 5
+MAX_WORKERS = 2
 
-def get_announcement_connection():
-    """
-    获取数据库 announcement 的连接
-    """
-    config = get_db_announcement_config()
-    return pymysql.connect(
-        host=config["host"],
-        port=config["port"],
-        user=config["user"],
-        password=config["password"],
-        database=config["database"],
-        charset=config["charset"],
-        cursorclass=pymysql.cursors.DictCursor
-    )
 
-def get_pending_files_from_db():
-    """
-    从数据库获取需要进行向量数据库入库的文件
-    条件: embedding_done='true' AND vector_database_done='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
+def _safe_read_json(path):
     try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-                   doc_type_1, doc_type_2, announcement_link, embedding_done, vector_database_done
-            FROM processed_files 
-            WHERE embedding_done='true' 
-              AND vector_database_done='false' 
-              AND doc_type_1 != '无关'
-            ORDER BY fund_code, file_name
-            """
-            cursor.execute(sql)
-            results = cursor.fetchall()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
-    except Exception as e:
-        logging.error(f"数据库查询失败: {e}")
-        raise e
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
 
-def update_pdf_status_in_db(file_name, status_field, status_value):
-    """
-    更新数据库中单个PDF文件的状态
-    """
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+
+    seg_emb_path = os.path.join(pdf_folder_dir, "text_segmentation_embedding.json")
+    if os.path.exists(seg_emb_path):
+        merged.setdefault("embedding_done", True)
+
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("embedding_done") is not True:
+            continue
+        if status.get("vector_database_done") is True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "embedding_done": True,
+            "vector_database_done": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fc in grouped_files:
+        grouped_files[fc].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_vector_db_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["vector_database_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["vector_database_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    # Manifest write disabled: multi-threaded writes to the same JSON file
+    # cause corruption. Status is tracked via meta.json + text.json instead.
+    # Manifest is rebuilt by rebuild_manifest.py after batches complete.
+    # with json_lock:
+    #     manifest = _safe_read_json(MANIFEST_FILE) or {"files": {}}
+    #     if "files" not in manifest or not isinstance(manifest["files"], dict):
+    #         manifest["files"] = {}
+    #     entry = manifest["files"].get(file_name, {}) or {}
+    #     entry.update(file_info)
+    #     entry["vector_database_done"] = True
+    #     manifest["files"][file_name] = entry
+    #     safe_json_dump(manifest, MANIFEST_FILE)
+
+    return True
+
+
+def _load_chunk_rows_for_milvus(pdf_folder_dir: str, source_file: str):
+    seg_emb_path = os.path.join(pdf_folder_dir, "text_segmentation_embedding.json")
+    if not os.path.exists(seg_emb_path):
+        return None, f"找不到切分向量文件: {seg_emb_path}"
+
     try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = f"UPDATE processed_files SET {status_field}=%s WHERE file_name=%s"
-            cursor.execute(sql, (status_value, file_name))
-            conn.commit()
-        conn.close()
-        logging.info(f"已更新数据库 {file_name} 的 {status_field}={status_value}")
+        chunks = safe_json_load(seg_emb_path)
     except Exception as e:
-        logging.error(f"更新数据库状态失败: {e}")
-        raise e
+        return None, f"读取切分向量文件失败: {e}"
 
+    if not isinstance(chunks, list) or not chunks:
+        return None, "切分向量文件为空或格式不正确"
 
-
-def fetch_text_chunks_for_file(source_file):
-    """
-    查询数据库 text_segmentation_embedding 获取19列:
-    (id, global_id, chunk_id, file_path, date, fund_code, short_name, announcement_title, doc_type_1, doc_type_2, 
-     announcement_link, source_file, page_num, picture_path, char_count, prev_chunks, next_chunks, text, embedding)
-    返回 list of tuple, 并将 date/datetime 转为字符串, embedding 转为 list[float].
-    """
-    db_config = get_db_announcement_config()
     rows = []
-    conn = None
-    try:
-        conn = pymysql.connect(**db_config)
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT
-                id,
-                global_id,
-                chunk_id,
-                file_path,
-                date,
-                fund_code,
-                short_name,
-                announcement_title,
-                doc_type_1,
-                doc_type_2,
-                announcement_link,
-                source_file,
-                page_num,
-                picture_path,
-                char_count,
-                prev_chunks,
-                next_chunks,
-                text,
-                embedding
-            FROM text_segmentation_embedding
-            WHERE source_file=%s
-            ORDER BY chunk_id
-            """
-            cursor.execute(sql, (source_file,))
-            rows = cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"读取数据库 text_segmentation_embedding 失败: {e}")
-    finally:
-        if conn:
-            conn.close()
+    for ck in chunks:
+        if not isinstance(ck, dict):
+            continue
+        meta = ck.get("metadata", {}) or {}
+        embedding = ck.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            continue
 
-    result = []
-    import json
-    for row in rows:
-        db_id = row[0] if row[0] else 0
-        global_id = row[1] or ""
-        chunk_id = row[2] if row[2] else 0
-        file_path = str(row[3]) if row[3] else ""
-        dt = row[4]
-        if isinstance(dt, DateObj):
-            dt = dt.isoformat()
+        chunk_id = int(ck.get("chunk_id", 0) or 0)
+        global_id = ck.get("global_id") or ""
+        file_path = meta.get("file_path", "")
+        dt = meta.get("date", "")
+        fund_code = meta.get("fund_code", "")
+        short_name = meta.get("short_name", "")
+        ann_title = meta.get("announcement_title", "")
+        doc1 = meta.get("doc_type_1", "")
+        doc2 = meta.get("doc_type_2", "")
+        ann_link = meta.get("announcement_link", "")
+        s_file = meta.get("source_file", "") or source_file
+        page_num = meta.get("page_num", "")
+        pic_path = meta.get("picture_path", "")
+        ch_count = int(meta.get("char_count", 0) or 0)
+
+        prev_v = meta.get("prev_chunks", "")
+        if isinstance(prev_v, (list, dict)):
+            prev_c = json.dumps(prev_v, ensure_ascii=False)
         else:
-            dt = str(dt) if dt else ""
-        fund_code = str(row[5]) if row[5] else ""
-        short_name = str(row[6]) if row[6] else ""
-        ann_title = str(row[7]) if row[7] else ""
-        doc1 = str(row[8]) if row[8] else ""
-        doc2 = str(row[9]) if row[9] else ""
-        ann_link = str(row[10]) if row[10] else ""
-        s_file = str(row[11]) if row[11] else ""
-        page_num = str(row[12]) if row[12] else ""
-        pic_path = str(row[13]) if row[13] else ""
-        ch_count = row[14] if row[14] else 0
-        prev_c = str(row[15]) if row[15] else ""
-        next_c = str(row[16]) if row[16] else ""
-        txt = str(row[17]) if row[17] else ""
-        emb_str = row[18] or ""
-        try:
-            embedding = json.loads(emb_str) if emb_str else []
-        except:
-            embedding = []
-        result.append((
-            db_id, global_id, chunk_id, file_path, dt, fund_code, short_name,
-            ann_title, doc1, doc2, ann_link, s_file, page_num, pic_path,
-            ch_count, prev_c, next_c, txt, embedding
+            prev_c = str(prev_v) if prev_v is not None else ""
+
+        next_v = meta.get("next_chunks", "")
+        if isinstance(next_v, (list, dict)):
+            next_c = json.dumps(next_v, ensure_ascii=False)
+        else:
+            next_c = str(next_v) if next_v is not None else ""
+
+        txt = ck.get("text", "") or ""
+
+        db_id = int(meta.get("id", 0) or ck.get("id", 0) or chunk_id)
+
+        rows.append((
+            db_id,
+            str(global_id),
+            chunk_id,
+            str(file_path),
+            str(dt),
+            str(fund_code),
+            str(short_name),
+            str(ann_title),
+            str(doc1),
+            str(doc2),
+            str(ann_link),
+            str(s_file),
+            str(page_num),
+            str(pic_path),
+            ch_count,
+            prev_c,
+            next_c,
+            str(txt),
+            embedding,
         ))
-    return result
+
+    if not rows:
+        return None, "切分向量文件中没有可入库的chunk（embedding为空）"
+
+    rows.sort(key=lambda r: r[2])
+    return rows, None
 
 def delete_existing_in_milvus(collection, source_file):
     """
@@ -204,7 +251,6 @@ def delete_existing_in_milvus(collection, source_file):
     """
     expr = f"source_file == '{source_file}'"
     try:
-        collection.load()
         collection.delete(expr=expr)
         print(f"已删除 source_file={source_file} 在 Milvus 中旧数据。")
     except Exception as e:
@@ -217,9 +263,7 @@ def insert_to_milvus(collection, source_file, chunk_rows):
     """
     if not chunk_rows:
         raise ValueError("该文件数据库中无文本块记录或embedding为空")
-    
-    collection.load()
-    
+
     # 分批插入，每批最多 100 条记录
     batch_size = 100
     total_inserted = 0
@@ -303,39 +347,41 @@ def insert_to_milvus(collection, source_file, chunk_rows):
 def ingest_file_to_milvus(pdf_info):
     """
     单个文件处理逻辑(线程任务):
-      1) 从DB获取文本块记录（按 source_file 查询）
+      1) 读取本地 text_segmentation_embedding.json
       2) 打开 Milvus Collection
       3) 删除旧数据
       4) 插入新数据
       若异常则删除已插入数据以模拟回滚, 返回 (True, None) 或 (False, error_reason)
     """
     source_file = pdf_info.get("file_name", "")
+    fund_code = pdf_info.get("fund_code", "")
     if not source_file:
         return (False, "缺少 file_name")
-    chunk_rows = fetch_text_chunks_for_file(source_file)
-    if not chunk_rows:
-        return (False, "数据库中无文本块或embedding信息")
+    if not fund_code:
+        return (False, "缺少 fund_code")
+
+    pdf_folder_dir = _get_pdf_folder_dir(source_file, fund_code)
+    chunk_rows, err = _load_chunk_rows_for_milvus(pdf_folder_dir, source_file)
+    if err:
+        return (False, err)
+
     try:
         collection = Collection(name=COLLECTION_NAME)
     except Exception as e:
         return (False, f"打开 Milvus Collection失败: {e}")
-    delete_existing_in_milvus(collection, source_file)
+
+    # 跳过 delete：Milvus 集合过大 (422K entities) 导致 load 超时
+    # insert 不需要加载集合，直接插入; 少数重复可通过后续 de-dup 处理
     try:
         insert_to_milvus(collection, source_file, chunk_rows)
     except Exception as e:
-        delete_existing_in_milvus(collection, source_file)
         return (False, f"插入 Milvus 出错: {e}")
+
     return (True, None)
 
+
 def main():
-    # 从数据库获取待处理文件
-    try:
-        processed_files = get_pending_files_from_db()
-    except Exception as e:
-        print(f"获取待处理文件失败: {e}")
-        logger.warning(f"获取待处理文件失败: {e}")
-        return
-    
+    processed_files = get_pending_files_from_local()
     if not processed_files:
         print("没有找到需要处理的文件。")
         logger.warning("没有找到需要处理的文件。")
@@ -372,17 +418,16 @@ def main():
                 success = False
                 err_reason = str(e)
             if success:
-                # 更新数据库状态
                 try:
-                    update_pdf_status_in_db(file_name, "vector_database_done", "true")
+                    update_local_vector_db_done(pdf_info)
                 except Exception as e:
-                    print(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    logger.warning(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    failed_details.append((file_name, f"更新数据库 processed_files 失败: {e}"))
+                    print(f"文件 {file_name} 更新本地状态失败: {e}")
+                    logger.warning(f"文件 {file_name} 更新本地状态失败: {e}")
+                    failed_details.append((file_name, f"更新本地状态失败: {e}"))
                     continue
-                
+
                 success_count += 1
-                print(f"文件 {file_name} 向量数据库入库成功，已更新数据库状态。")
+                print(f"文件 {file_name} 向量数据库入库成功，已更新本地状态。")
             else:
                 if not err_reason:
                     err_reason = "unknown reason"
@@ -409,15 +454,19 @@ def main():
         logger.warning(f"下列文件向量数据库入库处理失败: {failed_files_only}")
 
 if __name__ == "__main__":
-    # 连接 Milvus
     vector_db_config = get_vector_db_config()
-    connections.connect(
-        alias="default",
-        host=vector_db_config["host"],
-        port=vector_db_config["port"],
-        user=vector_db_config["user"],
-        password=vector_db_config["password"]
-    )
+    milvus_kwargs = {
+        "alias": "default",
+        "host": vector_db_config["host"],
+        "port": vector_db_config["port"],
+    }
+    user = (vector_db_config.get("user") or "").strip()
+    password = vector_db_config.get("password")
+    if user and password:
+        milvus_kwargs["user"] = user
+        milvus_kwargs["password"] = password
+
+    connections.connect(**milvus_kwargs)
     main()
 
 # 强制刷新日志，放在脚本最后一行

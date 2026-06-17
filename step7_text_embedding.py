@@ -19,18 +19,19 @@ import re
 import json
 import time
 import logging
-import pymysql
+import threading
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ------------------ import local configs ------------------
 import file_paths_config
-from db_config import get_db_announcement_config
 from model_config import MODEL_CONFIG
 from openai import OpenAI  # 封装 zhipu API
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
 
 MULTIFILE_OUTPUT_DIR = file_paths_config.OUTPUT_DIR
+MANIFEST_FILE = os.path.join(MULTIFILE_OUTPUT_DIR, "processed_files_local.json")
+json_lock = threading.Lock()
 
 # 日志文件 embedding.log, WARNING 及以上级别
 # 获取脚本所在目录，确保日志文件生成在log目录下
@@ -49,81 +50,144 @@ logger.addHandler(file_handler)
 # 并发线程数，可按需修改
 MAX_WORKERS = 5
 
+def _get_env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _get_env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 # embedding 相关配置
-EMBED_BATCH_SIZE = 64
+EMBED_BATCH_SIZE = _get_env_int("EMBED_BATCH_SIZE", 10)
+EMBED_RETRY_MAX = _get_env_int("EMBED_RETRY_MAX", 5)
+EMBED_RETRY_BASE_SECS = _get_env_float("EMBED_RETRY_BASE_SECS", 1.5)
 MAX_CHARS = 3000
 EMBEDDING_DIM = 2048
 
-def get_announcement_connection():
-    """
-    获取数据库 announcement 的连接
-    """
-    config = get_db_announcement_config()
-    return pymysql.connect(
-        host=config["host"],
-        port=config["port"],
-        user=config["user"],
-        password=config["password"],
-        database=config["database"],
-        charset=config["charset"],
-        cursorclass=pymysql.cursors.DictCursor
-    )
+def _safe_read_json(path):
+    try:
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("text_segmentation") is not True:
+            continue
+        if status.get("embedding_done") is True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "text_segmentation": True,
+            "embedding_done": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fc in grouped_files:
+        grouped_files[fc].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_embedding_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["embedding_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["embedding_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    manifest = _safe_read_json(MANIFEST_FILE) or {"files": {}}
+    if "files" not in manifest or not isinstance(manifest["files"], dict):
+        manifest["files"] = {}
+    entry = manifest["files"].get(file_name, {}) or {}
+    entry.update(file_info)
+    entry["embedding_done"] = True
+    manifest["files"][file_name] = entry
+    safe_json_dump(manifest, MANIFEST_FILE)
+    return True
+
 
 def get_pending_files_from_db():
-    """
-    从数据库获取需要进行向量化的文件
-    条件: text_segmentation='true' AND embedding_done='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-                   doc_type_1, doc_type_2, announcement_link, text_segmentation, embedding_done
-            FROM processed_files 
-            WHERE text_segmentation='true' 
-              AND embedding_done='false' 
-              AND doc_type_1 != '无关'
-            ORDER BY fund_code, file_name
-            """
-            cursor.execute(sql)
-            results = cursor.fetchall()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
-    except Exception as e:
-        logging.error(f"数据库查询失败: {e}")
-        raise e
-
-def update_pdf_status_in_db(file_name, status_field, status_value):
-    """
-    更新数据库中单个PDF文件的状态
-    """
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = f"UPDATE processed_files SET {status_field}=%s WHERE file_name=%s"
-            cursor.execute(sql, (status_value, file_name))
-            conn.commit()
-        conn.close()
-        logging.info(f"已更新数据库 {file_name} 的 {status_field}={status_value}")
-    except Exception as e:
-        logging.error(f"更新数据库状态失败: {e}")
-        raise e
+    return get_pending_files_from_local()
 
 class Config:
-    embedding_provider = "zhipu"
-    embedding_model = "embedding-3"
+    embedding_provider = "ali"
+    embedding_model = "text-embedding-v4"
 
 class OpenAIEmbeddings:
     """
@@ -142,123 +206,138 @@ class OpenAIEmbeddings:
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         all_embeddings = []
-        for i in range(0, len(texts), EMBED_BATCH_SIZE):
-            batch_texts = texts[i:i+EMBED_BATCH_SIZE]
-            # 截断
-            batch_texts = [t[:MAX_CHARS] for t in batch_texts]
-            print(f"正在生成向量 batch {i // EMBED_BATCH_SIZE + 1}, 文本数量: {len(batch_texts)}")
+        batch_size = EMBED_BATCH_SIZE
+        if Config.embedding_provider == "ali" and batch_size > 10:
+            batch_size = 10
+        if batch_size <= 0:
+            batch_size = 10
+
+        def _embed_once(batch_texts: List[str]) -> List[List[float]]:
+            response = self.client.embeddings.create(
+                model=self.model_name,
+                input=batch_texts,
+                encoding_format="float"
+            )
+            return [item.embedding for item in response.data]
+
+        def _embed_with_retry(batch_texts: List[str]) -> List[List[float]]:
+            for attempt in range(1, EMBED_RETRY_MAX + 1):
+                try:
+                    return _embed_once(batch_texts)
+                except Exception as e:
+                    if attempt >= EMBED_RETRY_MAX:
+                        raise
+                    wait = EMBED_RETRY_BASE_SECS * (2 ** (attempt - 1))
+                    logger.warning(f"向量生成失败，准备重试({attempt}/{EMBED_RETRY_MAX})，等待 {wait}s：{e}")
+                    time.sleep(wait)
+            raise RuntimeError("向量生成重试失败")
+
+        def _embed_resilient(batch_texts: List[str]) -> List[List[float]]:
             try:
-                response = self.client.embeddings.create(
-                    model=self.model_name,
-                    input=batch_texts,
-                    encoding_format="float"
-                )
-            except Exception as e:
-                logger.warning(f"向量生成API调用失败: {e}")
-                raise
-            for item in response.data:
-                all_embeddings.append(item.embedding)
+                return _embed_with_retry(batch_texts)
+            except Exception:
+                if len(batch_texts) <= 1:
+                    raise
+                mid = len(batch_texts) // 2
+                left = _embed_resilient(batch_texts[:mid])
+                right = _embed_resilient(batch_texts[mid:])
+                return left + right
+
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            batch_texts = [t[:MAX_CHARS] for t in batch_texts]
+            print(f"正在生成向量 batch {i // batch_size + 1}, 文本数量: {len(batch_texts)}")
+
+            embeddings = _embed_resilient(batch_texts)
+            all_embeddings.extend(embeddings)
+
         return all_embeddings
 
 def load_json_file(path):
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+
 def save_json_file(data, path):
     safe_json_dump(data, path)
 
-def fetch_chunks_for_file(db_conn, source_file):
-    """
-    从数据库 text_segmentation_embedding 表中读取指定 source_file 的文本块
-    返回 [ (id, global_id, chunk_id, text) ] 按 chunk_id 排序
-    """
-    sql = """
-    SELECT id, global_id, chunk_id, text
-    FROM text_segmentation_embedding
-    WHERE source_file = %s
-    ORDER BY chunk_id
-    """
-    with db_conn.cursor() as cursor:
-        cursor.execute(sql, (source_file,))
-        rows = cursor.fetchall()
-    return rows
+def load_json_file(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
-def clear_old_embeddings(db_conn, source_file):
-    """
-    清空该文件的 embedding 字段(设为 NULL)
-    """
-    sql = """
-    UPDATE text_segmentation_embedding
-    SET embedding = NULL
-    WHERE source_file = %s
-    """
-    with db_conn.cursor() as cursor:
-        cursor.execute(sql, (source_file,))
 
-def update_embeddings_for_chunks(db_conn, chunks, embeddings):
-    """
-    按照 id 逐条更新 embedding 字段
-    """
-    if len(chunks) != len(embeddings):
-        raise ValueError("chunks数量与embedding结果数量不匹配")
-    sql = """
-    UPDATE text_segmentation_embedding
-    SET embedding = %s
-    WHERE id = %s
-    """
-    with db_conn.cursor() as cursor:
-        import json
-        for (row_id, _, _, _), vector in zip(chunks, embeddings):
-            embedding_json = json.dumps(vector)
-            cursor.execute(sql, (embedding_json, row_id))
+def save_json_file(data, path):
+    safe_json_dump(data, path)
+
+
+def _load_segmentation_chunks(pdf_folder_dir: str):
+    seg_path = os.path.join(pdf_folder_dir, "text_segmentation.json")
+    if not os.path.exists(seg_path):
+        return None, f"切分文件不存在: {seg_path}"
+
+    try:
+        data = load_json_file(seg_path)
+    except Exception as e:
+        return None, f"读取切分文件失败: {e}"
+
+    if not isinstance(data, list):
+        return None, "切分文件格式不正确(应为list)"
+
+    return data, None
+
+
+def _save_segmentation_chunks(pdf_folder_dir: str, chunks):
+    seg_path = os.path.join(pdf_folder_dir, "text_segmentation.json")
+    save_json_file(chunks, seg_path)
+
+
+def _write_embedding_snapshot(pdf_folder_dir: str, chunks):
+    out_path = os.path.join(pdf_folder_dir, "text_segmentation_embedding.json")
+    save_json_file(chunks, out_path)
 
 def process_file_embedding(pdf_info):
-    """
-    针对单个文件的 embedding 处理逻辑(供线程池调用):
-      1) 与数据库建立连接, 开启事务
-      2) 根据 source_file 查询所有文本块
-      3) 清空旧 embedding
-      4) 生成 embedding
-      5) 逐条更新 embedding
-      6) 全部成功则 commit, 否则 rollback
-      7) 返回 (success, error_reason) => 由主线程决定日志 & 标记
-    """
-    source_file_val = pdf_info.get("file_name", "")
-    if not source_file_val:
+    file_name = pdf_info.get("file_name", "")
+    fund_code = pdf_info.get("fund_code", "")
+    if not file_name:
         return (False, "文件信息中缺少 file_name")
+    if not fund_code:
+        return (False, "文件信息中缺少 fund_code")
 
-    db_conf = get_db_announcement_config()
-    connection = None
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    if not os.path.exists(pdf_folder_dir):
+        return (False, f"PDF文件夹不存在: {pdf_folder_dir}")
+
+    chunks, err = _load_segmentation_chunks(pdf_folder_dir)
+    if err:
+        return (False, err)
+
+    texts = []
+    for ck in chunks:
+        if isinstance(ck, dict):
+            texts.append(str(ck.get("text", "")) if ck.get("text") is not None else "")
+        else:
+            texts.append("")
+
     try:
-        connection = pymysql.connect(**db_conf)
-        connection.begin()
-
-        # 查询文本块
-        chunks = fetch_chunks_for_file(connection, source_file_val)
-        if not chunks:
-            connection.rollback()
-            return (False, f"数据库中未找到 source_file={source_file_val} 的文本块记录")
-
-        # 清空旧 embedding
-        clear_old_embeddings(connection, source_file_val)
-
-        # 生成 embedding
-        texts = [r[3] for r in chunks]  # r=(id, global_id, chunk_id, text)
         embedder = OpenAIEmbeddings()
         embeddings = embedder.embed_documents(texts)
-
-        # 更新 embedding
-        update_embeddings_for_chunks(connection, chunks, embeddings)
-
-        connection.commit()
-        return (True, None)
     except Exception as e:
-        if connection:
-            connection.rollback()
         return (False, str(e))
-    finally:
-        if connection:
-            connection.close()
+
+    if len(embeddings) != len(chunks):
+        return (False, "chunks数量与embedding结果数量不匹配")
+
+    for ck, vec in zip(chunks, embeddings):
+        if isinstance(ck, dict):
+            ck["embedding"] = vec
+
+    try:
+        _save_segmentation_chunks(pdf_folder_dir, chunks)
+        _write_embedding_snapshot(pdf_folder_dir, chunks)
+    except Exception as e:
+        return (False, f"写入本地embedding结果失败: {e}")
+
+    return (True, None)
 
 def main():
     processed_files = get_pending_files_from_db()
@@ -293,22 +372,23 @@ def main():
             pdf_info = future_to_file[fut]
             file_name = pdf_info.get("file_name", "")
             try:
-                success, error_reason = fut.result()
+                # ═══ Fix 2: timeout guard — 300s per file, prevents silent hang ═══
+                success, error_reason = fut.result(timeout=300)
             except Exception as e:
                 success = False
                 error_reason = str(e)
                 logger.warning(f"文件 {file_name} embedding出现未知异常: {error_reason}")
 
             if success:
-                # 更新数据库 processed_files 表，仅更新 embedding_done 字段
-                try:
-                    update_pdf_status_in_db(file_name, "embedding_done", "true")
+                with json_lock:
+                    ok = update_local_embedding_done(pdf_info)
+                if ok:
                     success_count += 1
                     print(f"已完成 {file_name} 的向量化处理。")
-                except Exception as e:
-                    print(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    logger.warning(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    failed_details.append((file_name, f"更新数据库状态失败: {e}"))
+                else:
+                    print(f"文件 {file_name} 更新本地状态 embedding_done 失败。")
+                    logger.warning(f"文件 {file_name} 更新本地状态 embedding_done 失败。")
+                    failed_details.append((file_name, "更新本地状态失败"))
             else:
                 if not error_reason:
                     error_reason = "Unknown failure"

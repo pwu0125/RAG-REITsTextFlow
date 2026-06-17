@@ -1,25 +1,71 @@
 #扫描页跨页表格检测
 import os
 import cv2
-import torch
 import json
 import base64
 import shutil
 import logging
+import mimetypes
+import uuid
+import urllib.request
+import urllib.error
 import numpy as np
 from PIL import Image
 from openai import OpenAI
-from transformers import TableTransformerForObjectDetection
-import torchvision.transforms as transforms
 import re
 from builtins import open
 from step3_cross_page_table_detector import CrossPageTableDetector
 from model_config import MODEL_CONFIG
-from file_paths_config import OUTPUT_DIR, table_transformer_path  # 从配置文件中导入文件路径配置
+from file_paths_config import OUTPUT_DIR, PDF_DIR, table_transformer_path  # 从配置文件中导入文件路径配置
 import pytesseract  # [新增] 用于检测文字方向
 from pytesseract import TesseractError
-import pymysql
-from db_config import get_db_announcement_config  # 新增数据库配置导入
+from common_utils import safe_json_dump, safe_json_load
+
+MANIFEST_FILE = os.path.join(OUTPUT_DIR, "processed_files_local.json")
+
+_TORCH_IMPORT_ERROR = None
+try:
+    import torch
+    from transformers import TableTransformerForObjectDetection
+    import torchvision.transforms as transforms
+except Exception as e:
+    torch = None
+    TableTransformerForObjectDetection = None
+    transforms = None
+    _TORCH_IMPORT_ERROR = e
+
+
+def _require_torch():
+    if torch is None or TableTransformerForObjectDetection is None or transforms is None:
+        raise RuntimeError(
+            "扫描页表格检测需要先安装 torch/torchvision（就像先装好发动机才能开车）。"
+            "请运行：.venv/bin/pip install torch torchvision。"
+            f" 原始错误: {_TORCH_IMPORT_ERROR}"
+        )
+
+def _load_env_file(env_path: str):
+    try:
+        if not os.path.exists(env_path):
+            return
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if not k:
+                    continue
+                if (k not in os.environ) or (not os.environ.get(k)):
+                    os.environ[k] = v
+    except Exception:
+        return
+
+project_root = os.path.dirname(os.path.abspath(__file__))
+_load_env_file(os.path.join(project_root, ".env"))
 
 # 启用离线模式
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -47,12 +93,17 @@ class Config:
     # 连续页最小数量
     min_continuous_pages = 2
     
-    # 大模型配置
-    model_provider = "zhipu"  # 模型厂商名称
-    model_name = "GLM-4V-Flash"     # 模型名称
-    glm_timeout = 60
+    # 大模型配置（默认关闭云端复核以加速）
+    model_provider = "ali"
+    model_name = "qwen-vl-ocr-latest"
+    glm_timeout = 40
     glm_max_retry = 5
-    log_level = logging.DEBUG
+    log_level = logging.INFO
+    use_cloud_verify = False
+
+    # 方向检测缓存：若抽样页方向一致，则按 PDF 缓存一次；否则逐页检测
+    cache_orientation_per_pdf = True
+    orientation_sample_pages = 3
 
 # ====================
 # 初始化日志（修改后）
@@ -121,67 +172,107 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
 def get_pending_files_from_db():
-    """
-    从数据库获取需要进行扫描表格检测的文件
-    条件: text_extracted='true' AND table_detection_scan_done='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
-    db_conf = get_db_announcement_config()
-    conn = None
-    try:
-        conn = pymysql.connect(**db_conf)
-        cursor = conn.cursor(pymysql.cursors.DictCursor)
-        
-        sql = """
-        SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-               doc_type_1, doc_type_2, announcement_link
-        FROM processed_files 
-        WHERE text_extracted='true' 
-          AND table_detection_scan_done='false' 
-          AND doc_type_1 != '无关'
-        ORDER BY fund_code, file_name
-        """
-        
-        cursor.execute(sql)
-        results = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
-    except Exception as e:
-        if conn:
-            conn.close()
-        logging.error(f"数据库查询失败: {e}")
-        raise e
+    return get_pending_files_from_local()
 
-def update_database_status(file_name):
-    """更新数据库中的table_detection_scan_done状态"""
+def _safe_read_json(path):
     try:
-        db_config = get_db_announcement_config()
-        connection = pymysql.connect(**db_config)
-        with connection.cursor() as cursor:
-            sql = """UPDATE processed_files 
-                    SET table_detection_scan_done = %s 
-                    WHERE file_name = %s"""
-            cursor.execute(sql, ("true", file_name))  # 使用字符串 "true"
-        connection.commit()
-        logging.info(f"数据库状态更新成功: {file_name}")
-        return True
-    except Exception as e:
-        logging.error(f"数据库更新失败: {file_name} - {str(e)}")
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    if not os.path.exists(OUTPUT_DIR):
+        return {}
+
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+
+    grouped = {}
+    for file_name, base_info in files_map.items():
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("text_extracted") is not True:
+            continue
+        if status.get("table_detection_scan_done") is True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path") or os.path.join(PDF_DIR, file_name),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+        }
+        grouped.setdefault(fund_code, []).append(row)
+
+    for fund_code in grouped:
+        grouped[fund_code].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped
+
+
+def update_database_status(pdf_info):
+    file_name = pdf_info.get("file_name", "")
+    fund_code = pdf_info.get("fund_code", "")
+    if not file_name or not fund_code:
         return False
-    finally:
-        if connection:
-            connection.close()
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(pdf_info)
+    meta["text_extracted"] = True
+    meta["table_detection_scan_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta.update({
+            "text_extracted": True,
+            "table_detection_scan_done": True,
+        })
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    # [BATCH-FIX] manifest write removed — rebuilt by rebuild_manifest.py after step completes
+    return True
 
 # ====================
 # 辅助函数：解决中文路径读取问题
@@ -201,6 +292,7 @@ def cv2_imread_unicode(img_path):
 # 加载TableTransformer模型
 # ====================
 def load_models():
+    _require_torch()
     try:
         logging.info("Loading TableTransformer model...")
         model = TableTransformerForObjectDetection.from_pretrained(
@@ -226,7 +318,7 @@ def detect_text_orientation(img_path):
         return 'vertical'  # 默认竖直
     try:
         osd_data = pytesseract.image_to_osd(img, config='--psm 0')
-    except pytesseract.TesseractError as te:
+    except (pytesseract.TesseractError, OSError) as te:
         logging.warning(f"Tesseract OSD 出错，返回默认vertical: {te}")
         return 'vertical'
 
@@ -331,6 +423,7 @@ def extract_text_distances_rotated(image_path):
 # ====================
 class TableDetector:
     def __init__(self, model):
+        _require_torch()
         self.model = model
         self.transform = transforms.Compose([
             transforms.Resize((800, 800)),
@@ -396,14 +489,27 @@ class TableDetector:
 # ====================
 class ModelProcessor:
     def __init__(self):
-        # 查找匹配的模型配置
-        self.model_config = MODEL_CONFIG.get(Config.model_provider, {}).get(Config.model_name, None)
+        provider = (Config.model_provider or "").strip()
+        model_name = (Config.model_name or "").strip()
+
+        if provider == "kimi-latest" and not model_name:
+            provider = "kimi"
+            model_name = "kimi-latest"
+
+        self.provider = provider
+        self.model_name = model_name
+
+        self.model_config = MODEL_CONFIG.get(provider, {}).get(model_name, None)
         if not self.model_config:
-            raise ValueError(f"未找到模型配置: 厂商={Config.model_provider}, 模型={Config.model_name}")
-        self.client = OpenAI(
-            api_key=self.model_config["api_key"],
-            base_url=self.model_config["base_url"]
-        )
+            raise ValueError(f"未找到模型配置: 厂商={provider}, 模型={model_name}")
+
+        api_key = os.environ.get("KIMI_API_KEY") or os.environ.get("MOONSHOT_API_KEY")
+        base_url = os.environ.get("KIMI_BASE_URL") or self.model_config.get("base_url")
+
+        if not api_key or str(api_key).startswith("YOUR_"):
+            raise ValueError("缺少可用的 KIMI_API_KEY（就像门禁卡没带，进不去云端模型）。请在项目根目录 .env 里设置 KIMI_API_KEY=... 后重试。")
+
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.prompt = ("请分析图片并返回以下JSON信息：\n"
                        "as_table: 是否存在表格（true/false）\n"
                        "请注意，只返回has_table，其余内容都不要提供。")
@@ -427,6 +533,86 @@ class ModelProcessor:
             except Exception as e:
                 logging.warning(f"API调用失败: {str(e)}")
         return None
+
+    def _process_image_deepseek_ocr(self, img_path):
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        url = os.environ.get("DEEPSEEK_OCR_URL") or "https://api.deepseek.com/v1/ocr"
+
+        try:
+            with open(img_path, "rb") as f:
+                file_bytes = f.read()
+        except Exception as e:
+            logging.warning(f"API调用失败: 读取图片失败 - {str(e)}")
+            return None
+
+        boundary = "----" + uuid.uuid4().hex
+        mime_type = mimetypes.guess_type(img_path)[0] or "application/octet-stream"
+        filename = os.path.basename(img_path)
+
+        parts = []
+        parts.append((f"--{boundary}\r\n").encode("utf-8"))
+        parts.append((f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n").encode("utf-8"))
+        parts.append((f"Content-Type: {mime_type}\r\n\r\n").encode("utf-8"))
+        parts.append(file_bytes)
+        parts.append(b"\r\n")
+        parts.append((f"--{boundary}--\r\n").encode("utf-8"))
+        body = b"".join(parts)
+
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=Config.glm_timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            return self._infer_has_table_from_ocr_response(raw)
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = str(e)
+            logging.warning(f"API调用失败: Error code: {e.code} - {raw}")
+            return None
+        except Exception as e:
+            logging.warning(f"API调用失败: {str(e)}")
+            return None
+
+    def _infer_has_table_from_ocr_response(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = raw
+
+        if isinstance(data, dict):
+            if "tables" in data and data.get("tables"):
+                return {"has_table": True}
+            if "table" in data and data.get("table"):
+                return {"has_table": True}
+
+        text = self._collect_text(data)
+        if re.search(r"^\s*\|.+\|\s*$", text, flags=re.MULTILINE):
+            return {"has_table": True}
+        if "<table" in text.lower():
+            return {"has_table": True}
+        return {"has_table": False}
+
+    def _collect_text(self, obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, (int, float, bool)):
+            return ""
+        if isinstance(obj, list):
+            return "\n".join(self._collect_text(x) for x in obj)
+        if isinstance(obj, dict):
+            return "\n".join(self._collect_text(v) for v in obj.values())
+        return ""
 
     def _encode_image(self, img_path):
         """Base64编码图片"""
@@ -731,6 +917,25 @@ def process_single_pdf(pdf_info, model, detector, model_processor):
 
         input_img_dir = os.path.join(pdf_folder_dir, "temp_pdf_images")
         table_img_dir = os.path.join(pdf_folder_dir, "table_image")
+
+        # [FlagSync C] 防御性检查：temp_pdf_images 可能被 step5 清理
+        if not os.path.exists(input_img_dir):
+            if os.path.exists(table_img_dir) and os.listdir(table_img_dir):
+                logging.warning(
+                    f"temp_pdf_images missing but table_image exists "
+                    f"({len(os.listdir(table_img_dir))} images). "
+                    f"Marking scan_done for: {pdf_info['file_path']}"
+                )
+                update_database_status(pdf_info)
+                return True, None
+            else:
+                error_msg = (
+                    f"temp_pdf_images missing and no table_image found: "
+                    f"{pdf_info['file_path']}"
+                )
+                logging.error(error_msg)
+                return False, error_msg
+
         os.makedirs(table_img_dir, exist_ok=True)
 
         processed_pages = []
@@ -742,8 +947,7 @@ def process_single_pdf(pdf_info, model, detector, model_processor):
         # 处理空文件情况（只更新数据库状态）
         if not img_files:
             logging.debug(f"空图片目录: {input_img_dir}")  # 修改为debug级别
-            # 只更新数据库
-            update_database_status(pdf_info["file_name"])
+            update_database_status(pdf_info)
             return True, None  # 返回成功状态
 
         logging.info(f"开始处理文件: {pdf_info['file_path']}，共 {len(img_files)} 页")
@@ -774,9 +978,10 @@ def process_single_pdf(pdf_info, model, detector, model_processor):
             has_table = len(boxes) > 0
 
             model_result = None
-            if has_table:
+            if has_table and getattr(Config, "use_cloud_verify", False) and model_processor is not None:
                 model_result = model_processor.process_image(img_path)
-                has_table = model_result['has_table'] if model_result else False
+                if isinstance(model_result, dict) and "has_table" in model_result:
+                    has_table = bool(model_result["has_table"])
 
             with Image.open(img_path) as tmp_img:
                 page_width, page_height = tmp_img.size
@@ -843,7 +1048,7 @@ def process_single_pdf(pdf_info, model, detector, model_processor):
                 logging.info(f"成功处理补充拼接：{page_data['file']}")
 
         # ========== 只更新数据库状态 ==========
-        db_success = update_database_status(pdf_info["file_name"])
+        db_success = update_database_status(pdf_info)
         if not db_success:
             error_msg = f"数据库状态更新失败: {pdf_info['file_name']}"
             logging.error(error_msg)
@@ -1043,7 +1248,7 @@ class SupplementaryChecker:
 def main():
     model = load_models()
     detector = TableDetector(model)
-    model_processor = ModelProcessor()
+    model_processor = ModelProcessor() if getattr(Config, "use_cloud_verify", False) else None
     
     try:
         # 从数据库获取待处理文件
@@ -1106,14 +1311,18 @@ def main():
             logging.info(f"文件: {f['file_name']} - 错误: {f['error']}")
             print(f"文件: {f['file_name']} - 错误: {f['error']}")  # 终端也显示
 
-    if processed_count > 0 or len(failed_files) > 0:
-        completion_msg = "扫描表格检测全部完成！状态已更新至数据库。"
-        logging.info(completion_msg)
-        print(completion_msg)  # 终端也显示
-    else:
+    if total_files == 0:
         no_files_msg = "没有找到需要处理的文件。"
         logging.info(no_files_msg)
-        print(no_files_msg)  # 终端也显示
+        print(no_files_msg)
+    elif len(failed_files) == 0 and remaining == 0:
+        completion_msg = "扫描表格检测全部完成（无失败）。"
+        logging.info(completion_msg)
+        print(completion_msg)
+    else:
+        completion_msg = f"扫描表格检测已结束：成功 {processed_count}，失败 {len(failed_files)}，剩余 {remaining}。"
+        logging.info(completion_msg)
+        print(completion_msg)
 
 
 if __name__ == "__main__":

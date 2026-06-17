@@ -7,17 +7,19 @@ import os
 import time
 import json
 import logging
-import pymysql
+import threading
+import base64
 from typing import List
-from datetime import date as DateObj
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch, helpers
 
-from db_config import get_elasticsearch_config, get_db_announcement_config
+from db_config import get_elasticsearch_config
 import file_paths_config
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
 
 MULTIFILE_OUTPUT_DIR = file_paths_config.OUTPUT_DIR
+MANIFEST_FILE = os.path.join(MULTIFILE_OUTPUT_DIR, "processed_files_local.json")
+json_lock = threading.Lock()
 
 INDEX_NAME = "reits_announcements"
 # 获取脚本所在目录，确保日志文件生成在log目录下
@@ -40,156 +42,171 @@ MAX_WORKERS = 5
 # 初始化 ES
 es_config = get_elasticsearch_config()
 scheme = es_config.get('scheme', 'http')  # 默认使用 http
-es = Elasticsearch(
-    [f"{scheme}://{es_config['host']}:{es_config['port']}"],
-    basic_auth=(es_config['username'], es_config['password']),
-    verify_certs=False
-)
 
-def get_announcement_connection():
-    """
-    获取数据库 announcement 的连接
-    """
-    config = get_db_announcement_config()
-    return pymysql.connect(
-        host=config["host"],
-        port=config["port"],
-        user=config["user"],
-        password=config["password"],
-        database=config["database"],
-        charset=config["charset"],
-        cursorclass=pymysql.cursors.DictCursor
-    )
+es_hosts = [f"{scheme}://{es_config['host']}:{es_config['port']}"]
+es_username = (es_config.get('username') or '').strip()
+es_password = es_config.get('password')
+
+es_kwargs = {
+    "verify_certs": False,
+}
+
+if es_username and es_password:
+    token = base64.b64encode(f"{es_username}:{es_password}".encode("utf-8")).decode("ascii")
+    es_kwargs["headers"] = {"Authorization": f"Basic {token}"}
+
+es = Elasticsearch(es_hosts, **es_kwargs)
+
+def _safe_read_json(path):
+    try:
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("embedding_done") is not True:
+            continue
+        if status.get("elasticsearch_database_done") is True:
+            continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "embedding_done": True,
+            "elasticsearch_database_done": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fc in grouped_files:
+        grouped_files[fc].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_es_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["elasticsearch_database_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["elasticsearch_database_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    # [BATCH-FIX] manifest write removed — rebuilt by rebuild_manifest.py after step completes
+    return True
+
 
 def get_pending_files_from_db():
-    """
-    从数据库获取需要进行ES数据入库的文件
-    条件: embedding_done='true' AND elasticsearch_database_done='false' AND doc_type_1 != '无关'
-    返回: 按fund_code分组的文件列表字典
-    """
+    return get_pending_files_from_local()
+
+
+
+def _load_chunks_for_es(pdf_folder_dir: str, source_file: str):
+    preferred = os.path.join(pdf_folder_dir, "text_segmentation_embedding.json")
+    fallback = os.path.join(pdf_folder_dir, "text_segmentation.json")
+    path = preferred if os.path.exists(preferred) else fallback
+    if not os.path.exists(path):
+        return None, f"找不到切分文件: {preferred} 或 {fallback}"
+
     try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT file_name, file_path, date, fund_code, short_name, announcement_title,
-                   doc_type_1, doc_type_2, announcement_link, embedding_done, elasticsearch_database_done
-            FROM processed_files 
-            WHERE embedding_done='true' 
-              AND elasticsearch_database_done='false' 
-              AND doc_type_1 != '无关'
-            ORDER BY fund_code, file_name
-            """
-            cursor.execute(sql)
-            results = cursor.fetchall()
-        conn.close()
-        
-        # 按fund_code分组
-        grouped_files = {}
-        for row in results:
-            fund_code = row['fund_code']
-            if fund_code not in grouped_files:
-                grouped_files[fund_code] = []
-            grouped_files[fund_code].append(row)
-        
-        return grouped_files
-        
+        chunks = safe_json_load(path)
     except Exception as e:
-        logging.error(f"数据库查询失败: {e}")
-        raise e
+        return None, f"读取切分文件失败: {e}"
 
-def update_pdf_status_in_db(file_name, status_field, status_value):
-    """
-    更新数据库中单个PDF文件的状态
-    """
-    try:
-        conn = get_announcement_connection()
-        with conn.cursor() as cursor:
-            sql = f"UPDATE processed_files SET {status_field}=%s WHERE file_name=%s"
-            cursor.execute(sql, (status_value, file_name))
-            conn.commit()
-        conn.close()
-        logging.info(f"已更新数据库 {file_name} 的 {status_field}={status_value}")
-    except Exception as e:
-        logging.error(f"更新数据库状态失败: {e}")
-        raise e
+    if not isinstance(chunks, list) or not chunks:
+        return None, "切分文件为空或格式不正确"
 
+    docs = []
+    for ck in chunks:
+        if not isinstance(ck, dict):
+            continue
+        meta = ck.get("metadata", {}) or {}
+        docs.append({
+            "id": int(ck.get("chunk_id", 0) or 0),
+            "global_id": ck.get("global_id") or "",
+            "chunk_id": int(ck.get("chunk_id", 0) or 0),
+            "file_path": meta.get("file_path", ""),
+            "date": meta.get("date", ""),
+            "fund_code": meta.get("fund_code", ""),
+            "short_name": meta.get("short_name", ""),
+            "announcement_title": meta.get("announcement_title", ""),
+            "doc_type_1": meta.get("doc_type_1", ""),
+            "doc_type_2": meta.get("doc_type_2", ""),
+            "announcement_link": meta.get("announcement_link", ""),
+            "source_file": meta.get("source_file", "") or source_file,
+            "page_num": meta.get("page_num", ""),
+            "picture_path": meta.get("picture_path", ""),
+            "char_count": int(meta.get("char_count", 0) or 0),
+            "prev_chunks": json.dumps(meta.get("prev_chunks", []), ensure_ascii=False),
+            "next_chunks": json.dumps(meta.get("next_chunks", []), ensure_ascii=False),
+            "text": ck.get("text", "") or "",
+        })
 
+    if not docs:
+        return None, "切分文件中没有可入库的chunk"
 
-def fetch_text_chunks_for_file(source_file):
-    """
-    从数据库 text_segmentation_embedding 表中获取指定 source_file 的文本块，
-    返回包含 id, global_id, chunk_id, file_path, date, fund_code, short_name,
-    announcement_title, doc_type_1, doc_type_2, announcement_link, source_file, page_num,
-    picture_path, char_count, prev_chunks, next_chunks, text 等字段（不取 embedding），
-    并按 chunk_id 排序。
-    """
-    db_config = get_db_announcement_config()
-    rows = []
-    conn = None
-    try:
-        conn = pymysql.connect(**db_config)
-        with conn.cursor() as cursor:
-            sql = """
-            SELECT
-              id,
-              global_id,
-              chunk_id,
-              file_path,
-              date,
-              fund_code,
-              short_name,
-              announcement_title,
-              doc_type_1,
-              doc_type_2,
-              announcement_link,
-              source_file,
-              page_num,
-              picture_path,
-              char_count,
-              prev_chunks,
-              next_chunks,
-              text
-            FROM text_segmentation_embedding
-            WHERE source_file = %s
-            ORDER BY chunk_id
-            """
-            cursor.execute(sql, (source_file,))
-            rows = cursor.fetchall()
-    except Exception as e:
-        logger.warning(f"读取数据库失败: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    result = []
-    for row in rows:
-        dt = row[4]
-        if isinstance(dt, DateObj):
-            dt = dt.isoformat()  # 'YYYY-MM-DD'
-        else:
-            dt = str(dt) if dt else ""
-        row_dict = {
-            "id": row[0] or 0,
-            "global_id": row[1] or "",
-            "chunk_id": row[2] or 0,
-            "file_path": str(row[3]) if row[3] else "",
-            "date": dt,
-            "fund_code": str(row[5]) if row[5] else "",
-            "short_name": str(row[6]) if row[6] else "",
-            "announcement_title": str(row[7]) if row[7] else "",
-            "doc_type_1": str(row[8]) if row[8] else "",
-            "doc_type_2": str(row[9]) if row[9] else "",
-            "announcement_link": str(row[10]) if row[10] else "",
-            "source_file": str(row[11]) if row[11] else "",
-            "page_num": str(row[12]) if row[12] else "",
-            "picture_path": str(row[13]) if row[13] else "",
-            "char_count": row[14] if row[14] else 0,
-            "prev_chunks": str(row[15]) if row[15] else "",
-            "next_chunks": str(row[16]) if row[16] else "",
-            "text": str(row[17]) if row[17] else ""
-        }
-        result.append(row_dict)
-    return result
+    docs.sort(key=lambda d: d.get("chunk_id", 0))
+    return docs, None
 
 def delete_existing_from_es(source_file):
     """
@@ -227,38 +244,31 @@ def bulk_insert_es(source_file, docs):
     return resp
 
 def ingest_single_file(pdf_info):
-    """
-    单个文件处理逻辑(供线程任务调用):
-      1) 从 DB 获取文本块记录（按 source_file 查询）
-      2) 删除 ES 中旧数据（同一 source_file）
-      3) 批量插入新数据到 ES
-      4) 若插入过程中出现错误则删除已插入数据，并返回失败
-    """
     source_file = pdf_info.get("file_name", "")
+    fund_code = pdf_info.get("fund_code", "")
     if not source_file:
         return (False, "缺少 file_name")
-    chunk_rows = fetch_text_chunks_for_file(source_file)
-    if not chunk_rows:
-        return (False, "数据库中无文本块记录")
-    docs = []
-    for row in chunk_rows:
-        docs.append(row)
+    if not fund_code:
+        return (False, "缺少 fund_code")
+
+    pdf_folder_dir = _get_pdf_folder_dir(source_file, fund_code)
+    if not os.path.exists(pdf_folder_dir):
+        return (False, f"PDF文件夹不存在: {pdf_folder_dir}")
+
+    docs, err = _load_chunks_for_es(pdf_folder_dir, source_file)
+    if err:
+        return (False, err)
+
     delete_existing_from_es(source_file)
     try:
-        resp = bulk_insert_es(source_file, docs)
+        bulk_insert_es(source_file, docs)
     except Exception as e:
         delete_existing_from_es(source_file)
         return (False, f"插入ES出错: {e}")
     return (True, None)
 
 def main():
-    # 从数据库获取待处理文件
-    try:
-        processed_files = get_pending_files_from_db()
-    except Exception as e:
-        print(f"获取待处理文件失败: {e}")
-        logger.warning(f"获取待处理文件失败: {e}")
-        return
+    processed_files = get_pending_files_from_local()
     
     if not processed_files:
         print("没有找到需要处理的文件。")
@@ -297,17 +307,15 @@ def main():
                 success = False
                 err_reason = str(e)
             if success:
-                # 更新数据库状态
-                try:
-                    update_pdf_status_in_db(file_name, "elasticsearch_database_done", "true")
-                except Exception as e:
-                    print(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    logger.warning(f"文件 {file_name} 更新数据库 processed_files 失败: {e}")
-                    failed_details.append((file_name, f"更新数据库 processed_files 失败: {e}"))
+                with json_lock:
+                    ok = update_local_es_done(pdf_info)
+                if not ok:
+                    failed_details.append((file_name, "更新本地状态失败"))
+                    print(f"文件 {file_name} ES入库成功，但更新本地状态失败。")
                     continue
-                
+
                 success_count += 1
-                print(f"文件 {file_name} ES数据入库成功，已更新数据库状态。")
+                print(f"文件 {file_name} ES数据入库成功，已更新本地状态。")
             else:
                 if not err_reason:
                     err_reason = "unknown reason"

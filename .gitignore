@@ -1,4 +1,8 @@
-# Python
+# ═══════════════════════════════════════════════════════════
+# RAG-REITsTextFlow .gitignore
+# ═══════════════════════════════════════════════════════════
+
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,67 +27,115 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual Environment
+# ── Virtual Environment ──
 venv/
 ENV/
 env/
 .venv
+anaconda3/
+pkgs/
+conda-meta/
 
-# IDE
+# ── IDE ──
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+.claude/
+.hermes/
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# PyCharm
-.idea/
-
-# Logs
-*.log
-logs/
-
-# Database
-*.db
-*.sqlite3
-
-# 环境配置文件(如果使用.env方式)
-.env
-.env.local
-
-# 输出和临时文件
+# ── Data Directories (massive, not source code) ──
+announcement_document_processing_local/
+announcement_document_raw/
+debug_output/
 output/
-tmp/
-temp/
-*.tmp
-
-# PDF文件和处理结果(根据需要调整)
+log/
+log_rescan/
+manifest_backups/
+page_images/
+extracted_text/
 downloaded_pdfs/
 processed_output/
-*.pdf
 
-# 图片文件
+# ── Intermediate/Generated JSON ──
+*.json
+!BATCH_CONFIG.json
+!requirements-dev.json
+
+# ── Model Files ──
+table-transformer-detection/
+*.model
+*.pkl
+*.pickle
+models/
+*.safetensors
+*.bin
+*.h5
+*.onnx
+
+# ── Images ──
 *.jpg
 *.jpeg
 *.png
 *.gif
 *.bmp
+*.tiff
+*.svg
 
-# 模型文件
-*.model
-*.pkl
-*.pickle
-models/
+# ── PDFs ──
+*.pdf
 
-# 测试覆盖率
+# ── Logs ──
+*.log
+
+# ── Database ──
+*.db
+*.sqlite3
+
+# ── Secrets/Config ──
+.env
+.env.local
+db_config.py
+
+# ── Backup Files ──
+*_mbak_*.json
+backup_*/
+*_backup/
+*.bak
+*.backup
+
+# ── Zips/Archives ──
+*.zip
+*.tar.gz
+*.tar
+
+# ── OS ──
+Thumbs.db
+
+# ── Test/Coverage ──
 .coverage
 htmlcov/
 .pytest_cache/
 
-# 操作系统
-Thumbs.db
-.DS_Store
+# ── Local Runner Scripts ──
+_*.py
+_*.sh
+cc_report.sh
+run_add_opdata.sh
+run_all_batches_step8_2.sh
+add_operational_data.py
+add_ops_to_manifest.py
+additions_opdata*.json
+diagnosis_*.json
+
+# ── Other ──
+tmp/
+temp/
+*.tmp
+*.swp
+extract_text_onlyvactor_log.txt
+ngrok
+.metaguard_status.json
+pipeline_state.json

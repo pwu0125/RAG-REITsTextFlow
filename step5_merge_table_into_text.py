@@ -1,13 +1,21 @@
 # 表格页描述替换至全文文字里
 import os
 import re
+import sys
 import json
 import time
 import logging
+import threading
+import subprocess
 import pymysql
 import db_config
 from file_paths_config import OUTPUT_DIR as MULTIFILE_OUTPUT_DIR
-from common_utils import safe_json_dump
+from common_utils import safe_json_dump, safe_json_load
+
+PYTHON = "/Users/pyemini/anaconda3/envs/deepseek-ocr/bin/python"
+
+json_lock = threading.Lock()
+MANIFEST_FILE = os.path.join(MULTIFILE_OUTPUT_DIR, "processed_files_local.json")
 
 # ================ 日志配置（工作日志 merge.log，只记录失败信息和 WARNING 及以上级别消息） ================
 # 获取脚本所在目录，确保日志文件生成在log目录下
@@ -31,7 +39,6 @@ file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.setLevel(logging.WARNING)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 file_handler.addFilter(SpecificLogFilter())
-# 确保只添加一次 handler
 if not logger.handlers:
     logger.addHandler(file_handler)
 else:
@@ -39,6 +46,124 @@ else:
         if isinstance(h, logging.FileHandler):
             logger.removeHandler(h)
     logger.addHandler(file_handler)
+
+
+def _safe_read_json(path):
+    try:
+        if os.path.exists(path):
+            return safe_json_load(path)
+    except Exception:
+        return None
+    return None
+
+
+def _get_pdf_folder_dir(file_name: str, fund_code: str) -> str:
+    pdf_folder_name = os.path.splitext(file_name)[0]
+    return os.path.join(MULTIFILE_OUTPUT_DIR, fund_code, pdf_folder_name)
+
+
+def _infer_status_from_files(pdf_folder_dir: str):
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path) or {}
+    text_meta = text_json.get("metadata", {}) or {}
+
+    merged = {}
+    merged.update(text_meta)
+    merged.update(meta)
+    return merged
+
+
+def get_pending_files_from_local():
+    manifest = _safe_read_json(MANIFEST_FILE) or {}
+    files_map = manifest.get("files", {}) or {}
+    grouped_files = {}
+
+    for file_name, base_info in files_map.items():
+        if not isinstance(base_info, dict):
+            continue
+
+        fund_code = (base_info or {}).get("fund_code") or ""
+        if not fund_code:
+            continue
+
+        pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+        status = _infer_status_from_files(pdf_folder_dir)
+
+        if status.get("doc_type_1") == "无关":
+            continue
+        if status.get("merge_done") is True:
+            continue
+        if status.get("text_extracted") is not True:
+            continue
+        if status.get("table_describe_done") is not True:
+            continue
+        # Skip non-table describe check if no non-table images exist
+        # if status.get("not_table_describe_done") is not True:
+        #     continue
+
+        row = {
+            "file_name": file_name,
+            "file_path": (base_info or {}).get("file_path", ""),
+            "date": (base_info or {}).get("date") or status.get("date") or "",
+            "fund_code": fund_code,
+            "short_name": (base_info or {}).get("short_name") or status.get("short_name") or "",
+            "announcement_title": (base_info or {}).get("announcement_title") or status.get("announcement_title") or "",
+            "doc_type_1": status.get("doc_type_1") or "",
+            "doc_type_2": status.get("doc_type_2") or "",
+            "announcement_link": status.get("announcement_link") or "",
+            "text_extracted": True,
+            "table_describe_done": True,
+            "not_table_describe_done": True,
+            "merge_done": False,
+        }
+        grouped_files.setdefault(fund_code, []).append(row)
+
+    for fund_code in grouped_files:
+        grouped_files[fund_code].sort(key=lambda x: x.get("file_name", ""))
+
+    return grouped_files
+
+
+def update_local_merge_done(file_info):
+    file_name = file_info.get("file_name", "")
+    fund_code = file_info.get("fund_code", "")
+    if not file_name or not fund_code:
+        return False
+
+    pdf_folder_dir = _get_pdf_folder_dir(file_name, fund_code)
+    os.makedirs(pdf_folder_dir, exist_ok=True)
+
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    meta = _safe_read_json(meta_path) or {}
+    meta.update(file_info)
+    meta["merge_done"] = True
+    safe_json_dump(meta, meta_path)
+
+    text_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(text_path)
+    if isinstance(text_json, dict):
+        text_meta = text_json.get("metadata", {}) or {}
+        text_meta["merge_done"] = True
+        text_json["metadata"] = text_meta
+        safe_json_dump(text_json, text_path)
+
+    manifest = _safe_read_json(MANIFEST_FILE) or {"files": {}}
+    if "files" not in manifest or not isinstance(manifest["files"], dict):
+        manifest["files"] = {}
+    entry = manifest["files"].get(file_name, {}) or {}
+    entry.update(file_info)
+    entry["merge_done"] = True
+    manifest["files"][file_name] = entry
+    safe_json_dump(manifest, MANIFEST_FILE)
+    return True
+
+
+def get_pending_files_from_db():
+    return get_pending_files_from_local()
+
 # =======================================================================================================
 
 def get_announcement_connection():
@@ -334,11 +459,7 @@ def process_pdf_text_merge(pdf_key, pdf_info):
                 text_data["metadata"].setdefault(key, value)
         os.makedirs(os.path.dirname(text_json_path), exist_ok=True)
         save_json_file(text_data, text_json_path)
-        # 将文本数据写入数据库 page_data 表
-        if not update_page_data_db(pdf_info, text_data):
-            error_message = "更新数据库 page_data 失败"
-        else:
-            merge_success = True
+        merge_success = True
 
     # 仅存在描述文件时，创建新的文本文件并执行合并
     elif not text_exists and desc_exists:
@@ -350,11 +471,7 @@ def process_pdf_text_merge(pdf_key, pdf_info):
         os.makedirs(os.path.dirname(text_json_path), exist_ok=True)
         save_json_file(merged_data, text_json_path)
         print(f"已创建并更新文本文件: {text_json_path}")
-        # 将合并后的结果写入数据库 page_data 表
-        if not update_page_data_db(pdf_info, merged_data):
-            error_message = "更新数据库 page_data 失败"
-        else:
-            merge_success = True
+        merge_success = True
 
     # 两个文件均存在，正常处理合并
     else:
@@ -372,22 +489,76 @@ def process_pdf_text_merge(pdf_key, pdf_info):
         os.makedirs(os.path.dirname(text_json_path), exist_ok=True)
         save_json_file(merged_data, text_json_path)
         print(f"已更新文本文件: {text_json_path}")
-        # 更新数据库 page_data 表（先删除同一源文件记录，再插入新的记录）
-        if not update_page_data_db(pdf_info, merged_data):
-            error_message = "更新数据库 page_data 失败"
-        else:
-            merge_success = True
+        merge_success = True
 
     # 如果合并成功，返回成功状态，但不删除图片（图片删除将在数据库更新成功后进行）
     if merge_success:
         return {"success": True, "merge_completed": True, "pdf_folder": pdf_folder}
     else:
         return {"success": False, "error": error_message if error_message else "合并处理失败"}
-
 def main():
-    processed_files = get_pending_files_from_db()
-    files_to_process = []
+    merge_only = "--merge-only" in sys.argv
+    gate_mode = "--gate" in sys.argv
     
+    # ── 解析 --gate <batch_name> ──
+    batch_names = []  # GATE 模式下的批次名列表
+    if gate_mode:
+        try:
+            gate_idx = sys.argv.index("--gate")
+            if gate_idx + 1 < len(sys.argv):
+                batch_name = sys.argv[gate_idx + 1]
+                batch_names = [batch_name]
+            else:
+                print("❌ --gate 需要指定批次名，例如: python step5_merge_table_into_text.py --gate B1a")
+                sys.exit(1)
+        except ValueError:
+            pass
+    
+    # ── 默认模式：无参数时自动启用 GATE 模式 ──
+    if not merge_only and not gate_mode:
+        gate_mode = True
+        batch_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BATCH_CONFIG.json")
+        try:
+            with open(batch_config_path, 'r', encoding='utf-8') as f:
+                batch_config = json.load(f)
+            batch_names = list(batch_config.keys())
+            if not batch_names:
+                print("❌ BATCH_CONFIG.json 中没有定义批次，无法启用默认 GATE 模式")
+                print("   如需跳过 GATE 检查，请使用: python step5_merge_table_into_text.py --merge-only")
+                sys.exit(1)
+            print(f"🔍 默认 GATE 模式：自动检测到 {len(batch_names)} 个批次: {batch_names}")
+        except FileNotFoundError:
+            print("❌ 未找到 BATCH_CONFIG.json，无法启用默认 GATE 模式")
+            print("   如需跳过 GATE 检查，请使用: python step5_merge_table_into_text.py --merge-only")
+            sys.exit(1)
+        except Exception as e:
+            print(f"❌ 读取 BATCH_CONFIG.json 失败: {e}")
+            sys.exit(1)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # sync_text_metadata.py 在 merge 之前运行，
+    # 防止 text.json 中过时的 metadata 标志覆盖 meta.json 的正确值。
+    # 详见 sync_text_metadata.py 顶部文档。
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if gate_mode and batch_names:
+        sync_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_text_metadata.py")
+        # 逐个批次运行同步（每个批次独立报告）
+        for bn in batch_names:
+            print(f"\n🔄 同步 text.json metadata → meta.json (批次: {bn})...")
+            sync_result = subprocess.run(
+                [PYTHON, sync_script, bn],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if sync_result.returncode == 0:
+                print(f"  ✅ 批次 {bn} 标志一致，无需修复")
+            else:
+                print(f"  ⚠️  批次 {bn} 发现并修复了不一致的标志（详见上方输出）")
+        print()
+
+    processed_files = get_pending_files_from_local()
+
+    files_to_process = []
+
     # 遍历数据库查询结果，构建待处理列表
     for fund_code, pdf_list in processed_files.items():
         for pdf_info in pdf_list:
@@ -400,61 +571,157 @@ def main():
         logger.warning(msg_no_files)
         return
 
+    if merge_only:
+        print(f"🔧 merge-only 模式：只执行合并，不标记 merge_done，不删除图片")
+    if gate_mode and batch_names:
+        print(f"🔍 GATE 模式：合并后运行 GATE1 检查（批次: {batch_names}），通过后标记 merge_done + 删图")
     print(f"本次执行需要处理的文件数量: {total_files}")
     logger.warning(f"本次执行需要处理的文件数量: {total_files}")
 
     success_count = 0
     failed_files = []  # 记录 (文件名, 失败原因)
     total_deleted_images = 0
+    merged_folders = []  # GATE 模式下记录已合并的文件夹路径
 
     for pdf_info in files_to_process:
         file_name = pdf_info.get("file_name")
         print(f"开始处理 {file_name} 的描述替换...")
         logger.info(f"开始处理 {file_name} 的描述替换...")
-        
+
         result = process_pdf_text_merge(file_name, pdf_info)
-        
+
         if result["success"]:
-            # 先更新数据库状态
-            try:
-                update_pdf_status_in_db(file_name, "merge_done", "true")
-                print(f"已更新 {file_name} 数据库状态为 merge_done=True")
-                
-                # 数据库更新成功后，再删除图片
-                if result.get("merge_completed"):
-                    pdf_folder = result.get("pdf_folder")
-                    print(f"开始删除文件 {file_name} 对应文件夹中的图片...")
-                    deleted_count, failed_deletions = delete_images_in_subfolders(pdf_folder, file_name)
-                    
-                    if failed_deletions:
-                        # 图片删除失败，记录警告但不影响整体成功状态（因为数据库已更新）
-                        warn_msg = f"文件 {file_name} 图片删除部分失败: 成功删除 {deleted_count} 个，失败 {len(failed_deletions)} 个"
-                        print(warn_msg)
-                        logger.warning(warn_msg)
-                        for failure in failed_deletions:
-                            print(f"  删除失败: {failure}")
-                        total_deleted_images += deleted_count
-                    else:
-                        total_deleted_images += deleted_count
-                        
-                    succ_msg = f"已完成 {file_name} 的合并和图片清理，删除了 {deleted_count} 个图片文件。"
-                else:
-                    succ_msg = f"已完成 {file_name} 的合并处理。"
-                    
-                print(succ_msg)
-                logger.info(succ_msg)
+            if merge_only or gate_mode:
+                # merge-only / GATE 模式：跳过标记和删除，留给编排器在 GATE1 通过后处理
+                mode_label = "gate" if gate_mode else "merge-only"
+                print(f"已合并 {file_name} 的描述到文本（{mode_label}，未标记未删图）")
                 success_count += 1
-                
-            except Exception as e:
-                err_msg = f"文件 {file_name} 更新数据库 processed_files 失败: {e}"
+                if gate_mode:
+                    merged_folders.append({
+                        "file_name": file_name,
+                        "pdf_info": pdf_info,
+                        "pdf_folder": result.get("pdf_folder"),
+                    })
+                continue
+
+            with json_lock:
+                ok = update_local_merge_done(pdf_info)
+            if not ok:
+                err_msg = f"文件 {file_name} 更新本地状态 merge_done 失败。"
                 print(err_msg)
                 logger.warning(err_msg)
-                failed_files.append((file_name, f"更新数据库状态失败: {e}"))
+                failed_files.append((file_name, "更新本地状态失败"))
+                continue
+
+            print(f"已更新 {file_name} 本地状态为 merge_done=True")
+
+            if result.get("merge_completed"):
+                pdf_folder = result.get("pdf_folder")
+                print(f"开始删除文件 {file_name} 对应文件夹中的图片...")
+                deleted_count, failed_deletions = delete_images_in_subfolders(pdf_folder, file_name)
+
+                if failed_deletions:
+                    warn_msg = f"文件 {file_name} 图片删除部分失败: 成功删除 {deleted_count} 个，失败 {len(failed_deletions)} 个"
+                    print(warn_msg)
+                    logger.warning(warn_msg)
+                    for failure in failed_deletions:
+                        print(f"  删除失败: {failure}")
+                total_deleted_images += deleted_count
+
+                succ_msg = f"已完成 {file_name} 的合并和图片清理，删除了 {deleted_count} 个图片文件。"
+            else:
+                succ_msg = f"已完成 {file_name} 的合并处理。"
+
+            print(succ_msg)
+            logger.info(succ_msg)
+            success_count += 1
         else:
             fail_msg = f"{file_name} 合并处理失败: {result.get('error', '未知错误')}"
             print(fail_msg)
             logger.warning(fail_msg)
             failed_files.append((file_name, result.get('error', '未知错误')))
+
+    # ═══════════════════════════════════════════════════════
+    # GATE 模式：运行 GATE1 检查 → 通过后标记 + 删图
+    # ═══════════════════════════════════════════════════════
+    if gate_mode and batch_names and success_count > 0:
+        if failed_files:
+            print(f"\n⚠️  有 {len(failed_files)} 个文件合并失败，跳过 GATE1 检查")
+            for fn, reason in failed_files:
+                print(f"  失败: {fn} — {reason}")
+            sys.exit(1)
+
+        gate_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate1_coverage_check.py")
+        all_batches_passed = True
+        failed_batch = None
+
+        for batch_name in batch_names:
+            print(f"\n{'='*60}")
+            print(f"  合并完成，运行 GATE1 覆盖率检查 (批次: {batch_name})...")
+            print(f"{'='*60}")
+
+            gate_result = subprocess.run(
+                [PYTHON, gate_script, batch_name],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+
+            if gate_result.returncode == 0:
+                print(f"  ✅ GATE1 通过 (批次: {batch_name})")
+            else:
+                print(f"  ❌ GATE1 未通过 (批次: {batch_name})")
+                all_batches_passed = False
+                failed_batch = batch_name
+                break
+
+        if all_batches_passed:
+            # ✅ 所有批次 GATE1 通过 → 标记 merge_done + 删除 temp_pdf_images/
+            print(f"\n{'='*60}")
+            print(f"  ✅ 所有批次 GATE1 通过！标记 merge_done 并清理中间图片...")
+            print(f"{'='*60}")
+
+            marked = 0
+            deleted_total = 0
+
+            for item in merged_folders:
+                file_name = item["file_name"]
+                pdf_info = item["pdf_info"]
+                pdf_folder = item["pdf_folder"]
+
+                # 标记 merge_done
+                with json_lock:
+                    ok = update_local_merge_done(pdf_info)
+                if ok:
+                    print(f"  ✅ 已标记 merge_done: {file_name}")
+                    marked += 1
+                else:
+                    print(f"  ⚠️  标记 merge_done 失败: {file_name}")
+
+                # 删除 temp_pdf_images/ 目录
+                if pdf_folder and os.path.exists(pdf_folder):
+                    temp_images_dir = os.path.join(pdf_folder, "temp_pdf_images")
+                    if os.path.exists(temp_images_dir):
+                        try:
+                            import shutil
+                            shutil.rmtree(temp_images_dir)
+                            print(f"  🗑️  已删除: {temp_images_dir}")
+                        except Exception as e:
+                            print(f"  ⚠️  删除 temp_pdf_images 失败 ({file_name}): {e}")
+                    else:
+                        print(f"  ℹ️  temp_pdf_images 不存在，跳过: {file_name}")
+
+            print(f"\n  📊 GATE 模式完成: 标记 {marked} 篇, 图片已清理")
+            total_deleted_images = marked  # 用于最终报告
+
+        else:
+            # ❌ GATE1 失败 → 保留图片，退出
+            print(f"\n{'='*60}")
+            print(f"  ❌ GATE1 未通过 (批次: {failed_batch})！图片已保留，修复后可重新运行。")
+            if len(batch_names) == 1:
+                print(f"  修复后执行: python step5_merge_table_into_text.py --gate {failed_batch}")
+            else:
+                print(f"  修复后执行: python step5_merge_table_into_text.py")
+            print(f"{'='*60}")
+            sys.exit(1)
 
     remaining = total_files - success_count
     summary_msg = (
@@ -466,14 +733,19 @@ def main():
     )
     print(summary_msg)
     logger.warning(summary_msg)
-    
+
     if failed_files:
         fail_details = "处理失败的文件及原因：\n" + "\n".join([f"文件: {fn}, 原因: {reason}" for fn, reason in failed_files])
         print(fail_details)
         logger.warning(fail_details)
-        
+
     if remaining == 0 and total_files > 0:
-        final_msg = f"表格图片描述内容与文本内容合并全部完成！描述信息已写进数据库和json文件里，状态已更新至数据库。总计清理图片 {total_deleted_images} 个。"
+        if merge_only:
+            final_msg = f"合并处理全部完成！(merge-only 模式，merge_done 标记和图片清理由编排器在 GATE1 通过后执行)"
+        elif gate_mode and batch_names:
+            final_msg = f"合并 + GATE1 检查全部完成！batches={batch_names}"
+        else:
+            final_msg = f"表格图片描述内容与文本内容合并全部完成！描述信息已写进数据库和json文件里，状态已更新至数据库。总计清理图片 {total_deleted_images} 个。"
         print(final_msg)
         logger.warning(final_msg)
 

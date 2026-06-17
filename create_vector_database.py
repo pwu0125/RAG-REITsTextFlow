@@ -23,7 +23,7 @@ PORT = vector_db_config['port']
 
 # 集合名称和向量维度
 COLLECTION_NAME = "reits_announcement"
-EMBEDDING_DIM = 2048  # 根据您的 embedding 模型调整
+EMBEDDING_DIM = 1024  # 实际模型输出1024维（已验证：B1a-B2i全批次均为1024）
 
 # 1) 定义 Collection 的 Schema
 # 注意保证字段顺序、类型、max_length 与 step8_ingest_vector_database.py 插入时一致
