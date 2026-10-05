@@ -217,7 +217,7 @@ def delete_existing_from_es(source_file):
         query_body = {
             "query": {
                 "term": {
-                    "source_file.keyword": source_file
+                    "source_file": source_file
                 }
             }
         }

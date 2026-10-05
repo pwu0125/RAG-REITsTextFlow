@@ -228,13 +228,28 @@ def get_pending_files_from_local():
         pdf_folder_name = os.path.splitext(fn)[0]
         output_json_file = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "text.json")
 
+        # 修复 2026-08-15: 已完成判定优先读 meta.json（权威源）。
+        # 根因: pipeline_controller._auto_mark_merge_done 只写 meta.json merge_done=True，
+        # 不回写 text.json → 4393 个已完成文件被误判 pending（无过滤裸跑会重复处理）。
+        # 边界: meta.json 不存在/解析失败/字段缺失 → 不在此处跳过，落到下方 text.json 逻辑保守处理。
+        meta_path = os.path.join(OUTPUT_DIR, fund_code, pdf_folder_name, "meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta_data = json.load(f)
+                if isinstance(meta_data, dict) and meta_data.get("merge_done") is True:
+                    # ① meta.json merge_done=True: step5已完成正常删图 → 跳过
+                    continue
+            except Exception:
+                pass
+
         if os.path.exists(output_json_file):
             try:
                 with open(output_json_file, 'r', encoding='utf-8') as f:
                     existing = json.load(f)
                 meta = existing.get("metadata", {}) or {}
                 if meta.get("text_extracted") is True:
-                    # ① merge_done=True: step5已完成正常删图 → 跳过
+                    # ① text.json merge_done=True: 历史文件（仅 text.json 有标志）→ 跳过
                     if meta.get("merge_done") is True:
                         continue
                     # ② temp_pdf_images存在且非空 → 跳过
@@ -354,9 +369,105 @@ def convert_scanned_page_to_image(pdf_path: str, page_number: int, dpi: int, tem
     pix = page.get_pixmap(dpi=dpi)
     pix.save(image_path)
     pdf_document.close()
-    print(f"[转换图片] 已保存图片至 {image_path}")
 
 
+# ── 陷阱94修复(2026-10-05 方案A): 扫描页渲染后接 OCR 路由 ──────────────────
+# 每文档初始化一次: 按该文档扫描页总数决定全局后端(>20页大活走API, ≤20页本地MPS)。
+# backend 决策与 OCRBackend.resolve_for_files 的 2026-09-26 用户裁定一致。
+# 环境变量 STEP2_OCR_BACKEND=off 可整体关闭本功能(回退旧行为, 只渲染不提取)。
+_OCR_STATE = {"backend": None, "router": None}
+
+
+def _init_ocr_for_doc(pdf_folder_dir: str, scanned_pages: int) -> None:
+    """文档级初始化: 决定 backend 并预热 router(local 模型懒加载在首次调用)。"""
+    if os.environ.get("STEP2_OCR_BACKEND") == "off":
+        _OCR_STATE["backend"] = "off"
+        return
+    try:
+        from ocr_router import OCRRouter
+    except ImportError:
+        _OCR_STATE["backend"] = "off"
+        print("[OCR路由] ocr_router 不可用, 关闭 OCR 提取(陷阱94旧行为)")
+        return
+    forced = os.environ.get("STEP2_OCR_BACKEND")
+    if forced in ("local", "api"):
+        _OCR_STATE["backend"] = forced
+    else:
+        _OCR_STATE["backend"] = "api" if scanned_pages > 20 else "local"
+    _OCR_STATE["router"] = OCRRouter(mode="auto")
+    print(f"[OCR路由] 文档扫描页 {scanned_pages} → backend={_OCR_STATE['backend']}"
+          f" (决策写 {os.path.join(pdf_folder_dir, 'ocr_route.txt')})")
+    try:
+        with open(os.path.join(pdf_folder_dir, "ocr_route.txt"), "w", encoding="utf-8") as f:
+            f.write(f"backend={_OCR_STATE['backend']}\nscanned_pages={scanned_pages}\ndecided_at={datetime.datetime.now().isoformat()}\n")
+    except Exception:
+        pass
+
+
+def _ocr_rendered_page(image_path: str, pdf_folder_dir: str, scanned_pages_total: int) -> str:
+    """对渲染好的扫描页图片执行 OCR, 返回文本(失败返回空串)。"""
+    if _OCR_STATE.get("backend") is None:
+        _init_ocr_for_doc(pdf_folder_dir, scanned_pages_total)
+    backend = _OCR_STATE.get("backend")
+    if backend in (None, "off"):
+        return ""
+    router = _OCR_STATE.get("router")
+    if router is None:
+        return ""
+    for attempt in range(3):
+        try:
+            return router.ocr(image_path, page_type="scanned", force_backend=backend) or ""
+        except Exception as e:
+            print(f"[OCR重试] 第{attempt + 1}次失败: {e}")
+            import time as _t
+            _t.sleep(2 * (attempt + 1))
+    print(f"[OCR失败] 3次重试后放弃: {image_path}")
+    return ""
+
+
+def load_pdf_detect_routing(pdf_folder_dir: str, total_pages: int):
+    """
+    读取 meta.json 中 step0_detect_pdf_type.py 写入的 pdf_type 路由信息。
+
+    返回 (direct_render_pages, detect_type)：
+    - direct_render_pages: 1索引物理页码集合（仅 meta.json pages_needing_ocr
+      原集合，不含 mixed 保守扩边），应直接渲染为图片；
+    - detect_type: pdf_type 字符串；
+    - 若 meta.json 无 pdf_type / 为 detect_error / pages_needing_ocr 非 list，
+      返回 (None, None) → 调用方走现状逻辑（向后兼容存量文件）。
+
+    两档路由逻辑（mixed 扩边页设计缺陷修复，对应 508077 第 8/10 页丢失原生文本）：
+    1. direct_render_pages 只渲染真正判定为扫描的页（pages_needing_ocr）。
+       这些页原生文本层缺失，渲染后由后续 OCR 兜底，文本质量不受影响；
+    2. mixed 扩边页（扫描页 p±1）**不** 强制渲染：它们通常有完整矢量文本层，
+       走旧逻辑的矢量提取能拿到原生文本（质量优于 OCR）；旧逻辑在矢量提取失败
+       （乱码/汉字过少）时自动回退渲染，天然覆盖半扫描边界页，作为扩边安全网保留。
+    """
+    meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        return None, None
+    try:
+        meta = safe_json_load(meta_path)
+    except Exception:
+        return None, None
+    if not isinstance(meta, dict):
+        return None, None
+
+    detect_type = meta.get("pdf_type")
+    pno = meta.get("pages_needing_ocr")
+    if not detect_type or detect_type == "detect_error" or not isinstance(pno, list):
+        return None, None
+
+    direct_render_pages = set()
+    for p in pno:
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= p <= total_pages:
+            direct_render_pages.add(p)
+
+    return direct_render_pages, detect_type
 
 
 def process_single_file(args):
@@ -388,6 +499,7 @@ def process_single_file(args):
         file_pages_dict = existing_data.get("pages", {})
     else:
         file_pages_dict = {}
+    final_data = {"pages": file_pages_dict}  # 陷阱91防线: 预初始化, 防0页循环后未绑定
     # 用于存放扫描页转换后的图片
     temp_img_dir = os.path.join(pdf_folder_dir, "temp_pdf_images")
     os.makedirs(temp_img_dir, exist_ok=True)
@@ -396,6 +508,12 @@ def process_single_file(args):
         with pdfplumber.open(pdf_path) as pdf:
             total_pages = len(pdf.pages)
             print(f"[PDF处理] 文件 {pdf_path} 共 {total_pages} 页")
+
+            # pdf-inspector 前置路由（step0_detect_pdf_type.py 写入的 pdf_type）
+            direct_render_pages, detect_type = load_pdf_detect_routing(pdf_folder_dir, total_pages)
+            if detect_type is not None:
+                print(f"[路由] pdf_type={detect_type}, 直接渲染页: {sorted(direct_render_pages) if direct_render_pages else []}")
+
             for i in range(total_pages):
                 page_number = i + 1
                 if str(page_number) in file_pages_dict:
@@ -403,6 +521,38 @@ def process_single_file(args):
                     continue
                 print(f"[页面处理] 开始处理第 {page_number} 页")
                 page = pdf.pages[i]
+
+                # 路由命中：仅 pages_needing_ocr 原集合直接渲染，跳过矢量提取尝试。
+                # mixed 扩边页不在此集合（通常有完整矢量文本层，走下方旧逻辑拿到原生文本，
+                # 质量优于 OCR），但旧逻辑在矢量提取失败时自动回退渲染，天然覆盖半扫描边界页。
+                if direct_render_pages is not None and page_number in direct_render_pages:
+                    print(f"[路由标记] 第 {page_number} 页 命中 pdf-inspector OCR 页, 直接渲染(跳过矢量提取)")
+                    convert_scanned_page_to_image(pdf_path, page_number, 300, temp_img_dir)
+                    # ── 陷阱94修复(2026-10-05 用户批准方案A): 渲染后接 OCR 路由 ──
+                    # 全扫描文档此前只渲染不提取, text.json 0页 → 陷阱91防线拒绝 → 死循环。
+                    # 现在渲染完的页立即走 ocr_router 提取文本写入 pages。
+                    # 路由规则(resolve_for_files, 2026-09-26 用户裁定): >20页大活走API, 小活本地MPS。
+                    ocr_text = _ocr_rendered_page(
+                        os.path.join(temp_img_dir, f"page_{page_number}.png"),
+                        pdf_folder_dir, len(direct_render_pages))
+                    if ocr_text and len(ocr_text.strip()) >= 10:
+                        page_metadata = file_info.copy()
+                        page_metadata.update({
+                            "source_file": file_info["file_name"],
+                            "page_num": page_number,
+                            "ocr_backend": _OCR_STATE.get("backend", "unknown"),
+                        })
+                        file_pages_dict[str(page_number)] = {
+                            "text": ocr_text.strip(),
+                            "metadata": page_metadata,
+                        }
+                        final_data = {"pages": file_pages_dict, "metadata": file_info}
+                        with open(output_json_file, 'w', encoding='utf-8') as f:
+                            json.dump(final_data, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+                        print(f"[页面保存-OCR] 第 {page_number} 页 OCR文本 {len(ocr_text)} 字符 -> text.json")
+                    else:
+                        print(f"[OCR空返回] 第 {page_number} 页 OCR 未取到文本, 仅保留渲染图")
+                    continue
 
                 # 矢量文本提取
                 vector_text = extract_text_from_vector_page(page)
@@ -452,6 +602,29 @@ def process_single_file(args):
         with open(log_file_name, "a", encoding="utf-8") as log_f:
             log_f.write(f"文件 {pdf_path} 处理失败\n原因: {e}\n\n")
         return file_info  # 不改 text_extracted
+
+    # ── 陷阱91根治(2026-10-04): 置 True 前自检内容物 ──
+    # 历史上此处中断只写标志不写内容 → text_extracted=True 但 text.json 0页,
+    # 后续全链静默跳过(僵尸文档)。现在: pages 为空/文本总量<50 → 拒绝置 True,
+    # 大声报错, 让文档留在待处理队列。
+    final_data = final_data if (final_data is not None and isinstance(final_data, dict)) else {"pages": file_pages_dict}
+    _pages = final_data.get("pages")
+    if _pages is None and os.path.exists(output_json_file):
+        try:
+            with open(output_json_file, 'r', encoding='utf-8') as f:
+                _latest = json.load(f)
+            _pages = _latest.get("pages")
+        except Exception:
+            _pages = None
+    _pv = _pages.values() if isinstance(_pages, dict) else (_pages or [])
+    _n_pages = len(_pages) if isinstance(_pages, dict) else (len(_pages) if _pages else 0)
+    _total_chars = sum(len(v.get("text") or "") for v in _pv if isinstance(v, dict))
+    if _n_pages == 0 or _total_chars < 50:
+        print(f"[拒绝置位] {file_name}: text.json 页数 {_n_pages}, 总字数 {_total_chars} — "
+              f"内容物为空, 保留 text_extracted=False (陷阱91防线)")
+        with open(log_file_name, "a", encoding="utf-8") as log_f:
+            log_f.write(f"文件 {file_name}\n拒绝置位 text_extracted: 页数{_n_pages}/字数{_total_chars} (陷阱91防线)\n\n")
+        return file_info  # 不置 True
 
     file_info["text_extracted"] = True
 

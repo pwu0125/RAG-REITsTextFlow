@@ -254,7 +254,7 @@ def process_pdf_not_table_descriptions(pdf_info):
         description = None
         try:
             start_time = time.time()
-            description = generate_table_description(image_path, vendor="ali", model_name="qwen-vl-ocr-latest")
+            description = generate_table_description(image_path, vendor="ali", model_name="qwen-vl-ocr")
             elapsed_time = time.time() - start_time
             print(f"生成描述耗时 {elapsed_time:.2f} 秒。")
         except Exception as e:
@@ -267,7 +267,7 @@ def process_pdf_not_table_descriptions(pdf_info):
                     compressed_path = image_path
                 print(f"使用压缩图片: {compressed_path} 重新生成描述...")
                 start_time = time.time()
-                description = generate_table_description(compressed_path, vendor="ali", model_name="qwen-vl-ocr-latest")
+                description = generate_table_description(compressed_path, vendor="ali", model_name="qwen-vl-ocr")
                 elapsed_time = time.time() - start_time
                 print(f"压缩后图片生成描述耗时 {elapsed_time:.2f} 秒。")
                 image_path = compressed_path

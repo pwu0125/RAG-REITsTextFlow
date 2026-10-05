@@ -20,7 +20,7 @@ import sys
 from collections import defaultdict, Counter
 from pathlib import Path
 
-OUTPUT_DIR = Path("/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/announcement_document_processing_local")
+OUTPUT_DIR = Path("/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow/announcement_document_processing_local")
 
 def check_file(path, min_bytes=100):
     """Check if file exists and is larger than min_bytes."""

@@ -3,6 +3,10 @@
 
 """
 create_vector_database.py
+
+[DEPRECATED] Milvus 时代残留脚本（纯 Milvus 建 collection）。
+向量引擎已于 2026-07 迁移至 FAISS，集合创建/索引不再使用 Milvus。
+现行方案见 build_faiss_index.py。本文件保留仅作历史参考，勿再运行。
 """
 
 from pymilvus import (

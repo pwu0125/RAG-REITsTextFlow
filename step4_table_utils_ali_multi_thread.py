@@ -1,6 +1,7 @@
 # step4_table_utils_ali.py
 # 调用大模型进行图片描述——DashScope SDK
 import base64
+import json
 import os
 import random
 import ssl
@@ -11,7 +12,7 @@ from model_config import MODEL_CONFIG  # 引入配置文件
 
 # 默认的大模型厂商和模型名称
 DEFAULT_VENDOR = "ali"
-DEFAULT_MODEL_NAME = "qwen-vl-ocr-latest"
+DEFAULT_MODEL_NAME = "qwen-vl-ocr"
 
 # ── 瞬态/永久错误分类 ──────────────────────────────
 _TRANSIENT_ERROR_TYPES = {
@@ -248,7 +249,7 @@ def generate_table_description(
 
                 candidates = [model_config["model"]]
                 if vendor == "ali":
-                    for m in ["qwen-vl-ocr-latest"]:
+                    for m in ["qwen-vl-ocr"]:
                         if m not in candidates:
                             candidates.append(m)
 
@@ -303,8 +304,110 @@ def generate_table_description(
     return ""
 
 
+# ─── 结构化可比租金提取（OCR阶段集成，非事后补救）───
+
+# 关键词检测：判断一段表格描述是否属于「可比实例详情」
+_COMP_RENT_KEYWORDS = [
+    "可比实例", "可比项目", "比准租金", "市场租金",
+    "可比案例", "市场比较法", "周边可比",
+]
+
+_STRUCTURED_PROMPT = """你是一个数据提取专家。以下是中国REITs招募说明书评估报告章节中，由视觉模型生成的自然语言表格描述。
+
+请提取可比实例（周边类似项目）的租金信息，包括：
+- 每个可比实例的租金数值（保留原始数字）
+- 租金单位（元/平方米/月、元/平方米/天 等）
+- 估价对象的租金（target_rent，可能是"评估单价"或"比准租金"）
+- 资产名称
+
+如果描述文本中确实不包含任何租金数字，返回 {"error": "no_rent_in_text"}。
+
+如果有租金数据，返回 JSON：
+{
+  "asset_name": "资产名称",
+  "comp_rents": [数值列表],
+  "target_rent": 数值或null,
+  "rent_unit": "单位"
+}
+
+注意：只提取文本中已存在的数字，严禁编造。
+
+描述文本：
+{description}"""
+
+
+def is_comparable_rent_table(description: str) -> bool:
+    """检测表格描述是否属于可比实例租金表"""
+    if not description:
+        return False
+    desc_lower = description
+    # 必须同时命中「可比」类和「租金/元」类
+    has_comp = any(kw in desc_lower for kw in ["可比实例", "可比项目", "可比案例", "市场比较法"])
+    has_rent = any(kw in desc_lower for kw in ["元/平方米", "元/㎡", "元/月/平方米", "元/m²", "元/平方", "租金"])
+    return has_comp and has_rent
+
+
+def parse_comparable_rent_json(description: str) -> dict:
+    """
+    从自然语言表格描述中提取结构化可比租金 JSON。
+    使用 DashScope qwen-turbo（纯文本，零编造风险）。
+    
+    Args:
+        description: generate_table_description() 产出的自然语言描述
+    
+    Returns:
+        dict: 结构化租金数据，或 {"error": "..."}
+    """
+    import re
+    import requests
+    
+    api_key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+    if not api_key:
+        api_key = os.environ.get("ALI_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "no_dashscope_api_key"}
+    
+    prompt = _STRUCTURED_PROMPT.replace("{description}", description[:3000])
+    
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "qwen-turbo",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 1000,
+                },
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"]
+                json_match = re.search(r'\{[\s\S]*\}', content)
+                if json_match:
+                    return json.loads(json_match.group())
+                return {"error": "no_json_in_response", "raw": content[:200]}
+            elif resp.status_code == 429:
+                time.sleep((attempt + 1) * 5)
+            else:
+                if attempt == 0:
+                    time.sleep(2)
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+    
+    return {"error": "api_failed"}
+
+
 if __name__ == "__main__":
     image_path = r"***.png"
-    # 终端不再输出大模型返回内容，但函数依旧返回描述文本
     desc = generate_table_description(image_path)
-    print("描述生成完毕，不在终端显示大模型内容。\n")
+    print("描述生成完毕。\n")
+    if is_comparable_rent_table(desc):
+        print("检测到可比实例表，提取结构化JSON...")
+        result = parse_comparable_rent_json(desc)
+        print(json.dumps(result, ensure_ascii=False, indent=2))

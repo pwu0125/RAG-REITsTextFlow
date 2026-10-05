@@ -141,6 +141,19 @@ def process_pdf(file):
     entry.update(DEFAULT_STATUS)
 
     meta_path = os.path.join(pdf_folder_dir, "meta.json")
+    # 修复（2026-08-15）：manifest 脱节时本文件可能已被处理过，meta.json 已含
+    # text_extracted=True/merge_done=True 等状态标志。以 existing 为基底、entry 只补
+    # existing 缺失的键，保留既有状态标志与 step0 检测字段，避免被全新 entry 冲回 False。
+    if os.path.exists(meta_path):
+        try:
+            existing = safe_json_load(meta_path)
+            if isinstance(existing, dict):
+                for k, v in entry.items():
+                    if k not in existing:
+                        existing[k] = v
+                entry = existing
+        except Exception:
+            pass
     safe_json_dump(entry, meta_path)
 
     print(f"解析文件: {file} => 日期:{date},基金代码:{fund_code},基金简称:{short_name},公告:{announcement_title}")

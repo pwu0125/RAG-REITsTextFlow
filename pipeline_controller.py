@@ -31,9 +31,14 @@ BATCH_CONFIG_PATH = os.path.join(SCRIPT_DIR, "BATCH_CONFIG.json")
 MANIFEST_PATH = os.path.join(
     SCRIPT_DIR, "announcement_document_processing_local", "processed_files_local.json"
 )
+# FAISS 向量索引（Milvus 已退役 2026-07，向量引擎迁至 build_faiss_index.py 全量重建）
+FAISS_INDEX_PATH = os.path.abspath(os.path.join(
+    SCRIPT_DIR, "..", "..", "5_分析结果", "faiss_data", "reits_faiss.index"
+))
 
 # 步骤定义: (script_path, meta_flag, description)
 STEP_SEQUENCE = [
+    ("step0_detect_pdf_type.py", "pdf_type", "Step0 PDF类型检测"),
     ("step1_process_pdfs.py", "text_extracted", "Step1 PDF→PNG"),
     ("step2_extract_text_onlyvactor_multi_process.py", "text_extracted", "Step2 文本提取"),
     ("step3_1_detection_vactor_multi_process.py", "table_detection_vector_done", "Step3.1 向量表检测"),
@@ -44,7 +49,7 @@ STEP_SEQUENCE = [
     ("step6_text_segmentation.py", "text_segmentation", "Step6 文本分段"),
     ("step7_text_embedding.py", "embedding_done", "Step7 向量嵌入"),
     ("step8_1_ingest_elasticsearch_data.py", "elasticsearch_database_done", "Step8.1 ES入库+GATE2"),
-    ("step8_2_ingest_vector_database.py", "vector_database_done", "Step8.2 Milvus入库"),
+    ("step8_2_ingest_vector_database.py", "vector_database_done", "Step8.2 FAISS向量标志同步"),
 ]
 
 RETRY_MAX = 3
@@ -102,16 +107,16 @@ def run_preflight(batch_name: str, batch_codes: list):
         if mg and mg.get("status") == "needs_review":
             print(f"  ⚠️  MetaGuard 标记为 needs_review，继续但请检查上述重置项")
 
-    # ── Docker 连通性 ──
-    print(f"  Docker 连通性检查...")
+    # ── 连通性: ES + FAISS（Milvus 已退役，改查 FAISS 索引文件）──
+    print(f"  连通性检查...")
     es_ok = _check_port("localhost", 9200)
-    mv_ok = _check_port("localhost", 19530)
+    faiss_ok = os.path.exists(FAISS_INDEX_PATH)
     if not es_ok:
         print(f"  ⚠️  ES :9200 不可达")
-    if not mv_ok:
-        print(f"  ⚠️  Milvus :19530 不可达")
-    if es_ok and mv_ok:
-        print(f"  ✅ ES + Milvus 均可达")
+    if not faiss_ok:
+        print(f"  ⚠️  FAISS 索引文件不存在: {FAISS_INDEX_PATH}")
+    if es_ok and faiss_ok:
+        print(f"  ✅ ES 可达 + FAISS 索引就绪")
     else:
         print(f"  ⚠️  部分服务不可达，步骤 8.1/8.2 可能失败")
 
@@ -252,6 +257,18 @@ def _auto_mark_merge_done(batch_codes: list):
             continue
         meta["merge_done"] = True
         safe_json_dump(meta, meta_path)
+        # 同步回写 text.json 元数据 merge_done=True（修复 2026-08-15：
+        # 此前只写 meta.json 不回写 text.json，导致 step2 扫描时把 4393 个已完成文件
+        # 误判为 pending 并重复处理）。与 step5.update_local_merge_done 行为一致；
+        # text.json 不存在则跳过，不报错。
+        text_path = os.path.join(doc_dir, "text.json")
+        text_json = safe_read_json(text_path)
+        if isinstance(text_json, dict):
+            text_meta = text_json.get("metadata", {}) or {}
+            if isinstance(text_meta, dict):
+                text_meta["merge_done"] = True
+                text_json["metadata"] = text_meta
+                safe_json_dump(text_json, text_path)
         # 清理 temp_pdf_images/
         temp_dir = os.path.join(doc_dir, "temp_pdf_images")
         if os.path.isdir(temp_dir):
@@ -284,7 +301,10 @@ def run_pipeline_with_codes(batch_codes: list, label: str = "adhoc", resume: boo
     if start_idx > 0:
         skipped = [STEP_SEQUENCE[i][2] for i in range(start_idx)]
         print(f"已完成步骤: {skipped}")
-        print(f"从步骤 {start_idx} 开始 ({STEP_SEQUENCE[start_idx][2]})\n")
+        if start_idx < len(STEP_SEQUENCE):
+            print(f"从步骤 {start_idx} 开始 ({STEP_SEQUENCE[start_idx][2]})\n")
+        else:
+            print(f"所有步骤已完成\n")
 
     # ── 逐步执行 ──
     for i in range(start_idx, len(STEP_SEQUENCE)):
@@ -323,6 +343,9 @@ def run_pipeline_with_codes(batch_codes: list, label: str = "adhoc", resume: boo
     print(f"  步骤总数: {len(STEP_SEQUENCE)}")
     print(f"  文档总数: {total_docs}")
     print(f"{'=' * 60}\n")
+
+
+def _run_gate2(batch_name: str) -> bool:
     """运行 GATE2 精度检查。"""
     gate2_path = os.path.join(SCRIPT_DIR, "gate2_accuracy_check.py")
     if not os.path.exists(gate2_path):

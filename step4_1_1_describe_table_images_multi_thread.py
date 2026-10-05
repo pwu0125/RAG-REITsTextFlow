@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pymysql
 import db_config
 
-from step4_table_utils_ali_multi_thread import generate_table_description  # 调用生成描述的函数
+from step4_table_utils_ali_multi_thread import generate_table_description, is_comparable_rent_table, parse_comparable_rent_json  # 调用生成描述的函数
 from step4_compress_image import compress_image  # 调用压缩图片函数
 from file_paths_config import OUTPUT_DIR
 from common_utils import safe_json_dump, safe_json_load
@@ -361,6 +361,25 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path, 
             table_descriptions = {}
         table_descriptions[img_file] = record
         safe_json_dump(table_descriptions, describe_json_path)
+    
+    # ─── OCR阶段结构化提取：检测「可比实例」表 → 追加结构化JSON ───
+    if is_comparable_rent_table(description):
+        pdf_folder_path = os.path.dirname(describe_json_path)
+        comp_json_path = os.path.join(pdf_folder_path, "comp_rents_structured.json")
+        try:
+            # 只处理尚未提取的（避免重复API调用）
+            if not os.path.exists(comp_json_path):
+                structured = parse_comparable_rent_json(description)
+                if "error" not in structured:
+                    structured["fund_code"] = pdf_info.get("fund_code", "")
+                    structured["source_file"] = os.path.basename(pdf_info.get("file_path", "")) or pdf_info.get("file_name", "")
+                    structured["page_num"] = parse_page_numbers_from_filename(img_file)
+                    safe_json_dump(structured, comp_json_path)
+                    print(f"  → 可比租金结构化JSON已保存: {comp_json_path}")
+                else:
+                    print(f"  → 可比租金结构化失败: {structured.get('error')}")
+        except Exception as e:
+            print(f"  → 可比租金结构化异常: {e}")
     print(f"图片 {img_file} 已写入描述文件。")
     return True
 

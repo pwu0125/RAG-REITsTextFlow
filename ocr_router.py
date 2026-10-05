@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 # ── 常量 ──────────────────────────────────────────────
 LOCAL_PER_PAGE_SEC = 30       # MPS DeepSeek OCR 2 实测 ~28s，留余量
 API_PER_PAGE_SEC = 4          # 阿里云 qwen-vl-ocr 平均延迟
-LOCAL_MAX_PAGES = 20          # 本地模式建议上限（20页≈10分钟）
-BATCH_THRESHOLD_PAGES = 50    # 超过此数强制 API
+LOCAL_MAX_PAGES = 20          # 用户裁定(2026-09-26): 本地=补充辅助仅小活; >20页大活必走API
+BATCH_THRESHOLD_PAGES = 21    # (历史常量保留) 与 LOCAL_MAX_PAGES 对齐为硬分界
 
 # 默认模型路径
 DEFAULT_MODEL_PATH = os.path.expanduser(
@@ -91,6 +91,12 @@ class OCRRouter:
         """
         backend = force_backend or self._resolve_backend(page_type)
         if backend == "local":
+            # 本地模型缓存缺失时自动降级 API（2026-09-26 修复：缓存被清理导致 OSError）
+            if not os.path.isdir(self.model_path):
+                logger.warning(
+                    f"[LocalOCR] 本地模型缺失: {self.model_path} → 降级 API"
+                )
+                return self._ocr_api(image_path, prompt)
             return self._ocr_local(image_path, prompt)
         else:
             return self._ocr_api(image_path, prompt)
@@ -141,21 +147,21 @@ class OCRRouter:
     def resolve_for_files(
         self, scanned_count: int, table_count: int
     ) -> str:
-        """批量场景下决定全局后端"""
+        """批量场景下决定全局后端（2026-09-26 用户裁定：本地=补充辅助，仅小活；>20页大活必走API）
+
+        本地 DeepSeek-OCR-2 (MPS) 密集行有丢字（实测基金会名漏字），定位为补充辅助方案；
+        大批量(>20页)必须交给 API (qwen-vl-ocr)。
+        """
         total = scanned_count + table_count
-        if self.mode in ("local", "incremental"):
-            return "local"
         if self.mode in ("api", "batch"):
             return "api"
-        # auto
-        if total >= BATCH_THRESHOLD_PAGES:
-            logger.info(f"[Router] {total} pages → API (batch threshold)")
+        # local / incremental / auto 统一按页数硬规则路由：
+        #   >20 页（大活）→ API
+        #   ≤20 页（小活）→ 本地（模型缺失时由 ocr() 内部自动降级 API）
+        if total > LOCAL_MAX_PAGES:
+            logger.info(f"[Router] {total} pages > {LOCAL_MAX_PAGES} (大活) → API")
             return "api"
-        if total <= LOCAL_MAX_PAGES:
-            logger.info(f"[Router] {total} pages → local (≤{LOCAL_MAX_PAGES})")
-            return "local"
-        # 中间档：优先本地
-        logger.info(f"[Router] {total} pages → local (default)")
+        logger.info(f"[Router] {total} pages ≤ {LOCAL_MAX_PAGES} (小活) → local")
         return "local"
 
     # ── 本地 OCR ─────────────────────────────────
@@ -200,7 +206,7 @@ class OCRRouter:
             import base64
 
             vendor = "ali"
-            model_name = "qwen-vl-ocr-latest"
+            model_name = "qwen-vl-ocr"
             cfg = get_model_config(vendor, model_name)
 
             with open(image_path, "rb") as f:
@@ -220,7 +226,7 @@ class OCRRouter:
                 try:
                     response = dashscope.MultiModalConversation.call(
                         api_key=cfg["api_key"],
-                        model=cfg["base_url"].rstrip("/") if "base_url" in cfg else model_name,
+                        model=model_name,
                         messages=messages,
                     )
                     if response.status_code == 200:

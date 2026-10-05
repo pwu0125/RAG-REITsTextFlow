@@ -71,8 +71,8 @@ _load_env_file(os.path.join(project_root, ".env"))
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-# 设置Tesseract数据路径
-os.environ["TESSDATA_PREFIX"] = "/usr/share/tesseract/tessdata"
+# 设置Tesseract数据路径（homebrew macOS 实际路径优先，不覆盖外部已设值）
+os.environ.setdefault("TESSDATA_PREFIX", "/opt/homebrew/share/tessdata")
 
 # ====================
 # 配置区
@@ -95,7 +95,7 @@ class Config:
     
     # 大模型配置（默认关闭云端复核以加速）
     model_provider = "ali"
-    model_name = "qwen-vl-ocr-latest"
+    model_name = "qwen-vl-ocr"
     glm_timeout = 40
     glm_max_retry = 5
     log_level = logging.INFO

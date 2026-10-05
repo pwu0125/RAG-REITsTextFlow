@@ -18,7 +18,12 @@ def get_db_announcement_config():
 
 def get_vector_db_config():
     """
-    返回向量数据库（Milvus）的连接配置信息。
+    [DEPRECATED] 返回向量数据库（Milvus）的连接配置信息。
+
+    向量引擎已于 2026 年 7 月迁移至 FAISS（build_faiss_index.py 全量重建，
+    索引文件 5_分析结果/faiss_data/reits_faiss.index）。
+    本函数仅保留以兼容旧引用（如 create_vector_database.py / milvus 备份脚本），
+    新代码请勿使用。
     """
     vector_db_config = {
         'host': 'localhost',  # 本地 Docker 部署的 Milvus

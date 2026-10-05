@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 # RAG Pipeline — 全量重扫 (Steps 2-7)
-# 工作目录: /Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/
+# 工作目录: /Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow/
 # 数据: 1,465 核心文档 (年报+中报+季报+招募说明书)
 # ============================================================
 set -euo pipefail
 
-WORK_DIR="/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow"
+WORK_DIR="/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow"
 CONDA_ENV="deepseek-ocr"
 LOG_DIR="$WORK_DIR/log_rescan"
 mkdir -p "$LOG_DIR"

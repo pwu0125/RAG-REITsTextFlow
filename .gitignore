@@ -138,3 +138,9 @@ extract_text_onlyvactor_log.txt
 ngrok
 .metaguard_status.json
 pipeline_state.json
+
+# secrets & backups (2026-10-06)
+.env
+.env.*
+*.bak
+*.bak_*

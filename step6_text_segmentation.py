@@ -404,6 +404,18 @@ def process_pdf_segmentation(pdf_folder):
 
     text_data = load_json_file(text_json_path)
     pages = text_data.get("pages", {})
+    
+    # 【坑#4防护】自动将list格式的pages转为dict（Step6期望dict，但手写text.json可能用list）
+    if isinstance(pages, list):
+        new_pages = {}
+        for idx, pg in enumerate(pages):
+            if isinstance(pg, dict):
+                page_key = pg.get('page', str(idx + 1))
+                new_pages[str(page_key)] = pg
+        if new_pages:
+            print(f"  ⚠️  text.json pages是list格式（{len(pages)}条），已自动转为dict")
+            pages = new_pages
+    
     if not pages:
         print(f"{text_json_path} 中没有页面数据。")
         return False

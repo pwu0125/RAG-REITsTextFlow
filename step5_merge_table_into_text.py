@@ -76,6 +76,34 @@ def _infer_status_from_files(pdf_folder_dir: str):
     return merged
 
 
+def _merge_actually_done(pdf_folder_dir: str) -> bool:
+    """文件驱动判断 merge 是否真正完成（不受陈旧 merge_done 标志影响）。
+
+    规则: table_describe.json 中的单页/多页记录，其页码必须已反映在 text.json pages 中，
+    才算真正合并完成。纯文本档案（无 table_describe.json）以 text.json 有页面内容为准。
+    """
+    d_path = os.path.join(pdf_folder_dir, "table_describe.json")
+    t_path = os.path.join(pdf_folder_dir, "text.json")
+    text_json = _safe_read_json(t_path) if os.path.exists(t_path) else None
+    pages = (text_json or {}).get("pages", {}) if isinstance(text_json, dict) else {}
+    if not isinstance(pages, dict):
+        pages = {}
+    if not os.path.exists(d_path):
+        return bool(pages)  # 纯文本档案：有页面即视为已合并
+    desc_data = _safe_read_json(d_path)
+    if not isinstance(desc_data, dict):
+        return bool(pages)
+    needed = set()
+    for rec in desc_data.values():
+        pn = str((rec or {}).get("page_num", "")).strip()
+        for part in pn.split("-"):
+            if part.isdigit():
+                needed.add(str(int(part)))
+    if not needed:
+        return bool(pages)
+    return needed.issubset(set(pages.keys()))
+
+
 def get_pending_files_from_local():
     manifest = _safe_read_json(MANIFEST_FILE) or {}
     files_map = manifest.get("files", {}) or {}
@@ -96,7 +124,9 @@ def get_pending_files_from_local():
         if status.get("doc_type_1") == "无关":
             continue
         if status.get("merge_done") is True:
-            continue
+            # 文件驱动校验：merge_done 标志 + 磁盘合并产物双重确认，防止陈旧标志误跳过
+            if _merge_actually_done(pdf_folder_dir):
+                continue
         if status.get("text_extracted") is not True:
             continue
         if status.get("table_describe_done") is not True:

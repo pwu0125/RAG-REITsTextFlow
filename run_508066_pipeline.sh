@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_508066_pipeline.sh — 508066招募说明书 全量提取管道
 set -e
-cd /Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow
+cd /Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow
 PY=/Users/pyemini/anaconda3/envs/deepseek-ocr/bin/python
 DOC="2022-05-06"
 LOG=/tmp/pipeline_508066_$(date +%Y%m%d_%H%M%S).log

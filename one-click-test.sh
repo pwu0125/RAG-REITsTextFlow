@@ -5,10 +5,10 @@
 # 自动扫描 raw/ → 注册新 PDF → 跑全管道 step1→step8
 
 set -euo pipefail
-cd /Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow
+cd /Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow
 
 PYTHON=/Users/pyemini/anaconda3/envs/deepseek-ocr/bin/python
-LOG_DIR=/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/log
+LOG_DIR=/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow/log
 mkdir -p "$LOG_DIR"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

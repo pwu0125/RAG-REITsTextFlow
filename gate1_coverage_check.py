@@ -181,6 +181,14 @@ def run_gate1(batch_name: str) -> bool:
     batch_codes = get_batch_codes(batch_name)
     print(f"  REITs: {batch_codes}")
 
+    # 【坑#3防护】如BATCH_CONFIG无此批次，回退到BATCH_CODES环境变量
+    if not batch_codes:
+        from common_utils import get_codes_from_env_or_config
+        batch_codes = get_codes_from_env_or_config()
+        if batch_codes:
+            print(f"  ⚠️ BATCH_CONFIG中未找到批次 {batch_name}，已从BATCH_CODES env回退")
+            print(f"  REITs(env): {batch_codes}")
+
     # 2) 筛选批次文档
     batch_docs = get_batch_docs(batch_codes)
     total = len(batch_docs)

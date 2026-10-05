@@ -188,7 +188,32 @@ def get_pending_files_from_db():
 
 class Config:
     embedding_provider = "ali"
+    # 2026-09-26 修正: 单纯切 v4→v3/v2 都不是正解——索引权威是 build_faiss_index 的本地 bge-base-zh-v1.5
+    # (768维). step7 的 API 嵌入(1024维 v4)产物会被索引维度过滤静默跳过(508606/508610 事件).
+    # 正解 = step7 直接走本地 bge(与索引同源), 见 LocalBgeEmbeddings; 环境变量可强制回退 API:
+    #   STEP7_EMBEDDING=api  恢复旧行为(不推荐)
     embedding_model = "text-embedding-v4"
+    use_local_bge = os.environ.get("STEP7_EMBEDDING", "local") != "api"
+
+class LocalBgeEmbeddings:
+    """本地 bge-base-zh-v1.5 (768维) — 与 build_faiss_index.py 索引同源.
+    2026-09-26 新增: 修复 step7 走 ali v4(1024维) 产物被索引维度过滤静默跳过的问题."""
+
+    _model = None
+
+    def __init__(self):
+        from sentence_transformers import SentenceTransformer
+        if LocalBgeEmbeddings._model is None:
+            LocalBgeEmbeddings._model = SentenceTransformer(
+                "BAAI/bge-base-zh-v1.5", device="mps")
+        self.model = LocalBgeEmbeddings._model
+
+    def embed_documents(self, texts):
+        vecs = self.model.encode(
+            texts, batch_size=64, normalize_embeddings=True,
+            show_progress_bar=False)
+        return [v.tolist() for v in vecs]
+
 
 class OpenAIEmbeddings:
     """
@@ -320,7 +345,10 @@ def process_file_embedding(pdf_info):
             texts.append("")
 
     try:
-        embedder = OpenAIEmbeddings()
+        if Config.use_local_bge:
+            embedder = LocalBgeEmbeddings()
+        else:
+            embedder = OpenAIEmbeddings()
         embeddings = embedder.embed_documents(texts)
     except Exception as e:
         return (False, str(e))

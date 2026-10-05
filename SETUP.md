@@ -15,8 +15,8 @@
 # Elasticsearch 配置
 'password': 'YOUR_ELASTICSEARCH_PASSWORD'  # 替换为您的Elasticsearch密码
 
-# Milvus 向量数据库配置
-'password': 'YOUR_MILVUS_PASSWORD'  # 替换为您的Milvus密码
+# 向量引擎（FAISS）配置
+# 向量引擎已于 2026-07 从 Milvus 迁移至本地 FAISS 索引（见 4.3 节），无需数据库连接配置
 
 # 远程数据库配置(如需要)
 'host': 'YOUR_REMOTE_HOST'  # 替换为远程数据库地址
@@ -80,11 +80,19 @@ table_transformer_path = r"/your/path/to/table-transformer-detection"
 python create_elasticsearch_index.py
 ```
 
-### 4.3 Milvus 向量数据库
+### 4.3 FAISS 向量索引（Milvus 已废弃）
+
+向量引擎已于 2026-07 从 Milvus 迁移至本地 FAISS 索引。无需安装/运行 Milvus 容器，也无需 `pymilvus`。
 
 ```bash
+# 安装依赖
+pip install faiss-cpu sentence-transformers
 
-# 安装Milvus后运行创建向量库脚本
-python create_vector_database.py
+# 全量重建 FAISS 索引（生成 embedding + 构建索引）
+python build_faiss_index.py
 ```
+
+- 索引输出：`~/REITs/2_公告数据/5_分析结果/faiss_data/`（`reits_faiss.index` + `reits_faiss_meta.json`）
+- 可用 `python build_faiss_index.py --verify` 验证索引、`--index-only` 仅重建索引、`--no-es-filter` 跳过 ES 过滤
+- `create_vector_database.py`（Milvus collection 初始化）已废弃，仅作历史保留
 

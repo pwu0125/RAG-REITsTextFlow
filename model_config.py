@@ -50,8 +50,8 @@ MODEL_CONFIG = {
          }
     },
     "ali": {
-         "qwen-vl-ocr-latest": {
-                  "model": "qwen-vl-ocr-latest",
+         "qwen-vl-ocr": {
+                  "model": "qwen-vl-ocr",
                   "api_key": os.environ.get("ALI_API_KEY", ""),
                   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
          },
@@ -65,8 +65,8 @@ MODEL_CONFIG = {
                   "api_key": os.environ.get("ALI_API_KEY", ""),
                   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
          },
-         "deepseek-v3": {
-                  "model": "deepseek-v3",
+         "deepseek-v4-pro": {
+                  "model": "deepseek-v4-pro",
                   "api_key": os.environ.get("ALI_API_KEY", ""),
                   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
          },
@@ -81,6 +81,14 @@ MODEL_CONFIG = {
                   "model": "kimi-latest",
                   "api_key": "",
                   "base_url": "https://api.moonshot.cn/v1"
+         }
+    },
+    # B线(2026-10-05): Zcode 的 GLM-5.3-Flash 视觉描述通道, OpenAI兼容
+    "glm": {
+         "GLM-5.3-Flash": {
+                  "model": "GLM-5.3-Flash",
+                  "api_key": os.environ.get("GLM_API_KEY", ""),
+                  "base_url": os.environ.get("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
          }
     }
 }

@@ -14,7 +14,7 @@ BOTTOM_CROP_PIXELS = 300 # 下边距裁剪像素（可调整）
 
 # 默认的大模型厂商和模型名称
 DEFAULT_VENDOR = "ali"
-DEFAULT_MODEL_NAME = "qwen-vl-ocr-latest"
+DEFAULT_MODEL_NAME = "qwen-vl-ocr"
 
 def crop_image(image_path: str) -> bytes:
     """

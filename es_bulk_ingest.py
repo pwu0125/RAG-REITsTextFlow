@@ -5,7 +5,7 @@ import os, json, time, base64, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch, helpers
 
-BASE = "/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/announcement_document_processing_local"
+BASE = "/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow/announcement_document_processing_local"
 JSON_PATH = os.path.join(BASE, "processed_files_local.json")
 INDEX = "reits_announcements"
 MAX_WORKERS = 5
@@ -13,7 +13,7 @@ json_lock = threading.Lock()
 
 # ----- ES 连接 -----
 env = {}
-with open("/Users/pyemini/REITs/REITs_Text_data_pipeline/RAG-REITsTextFlow/.env") as f:
+with open("/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow/.env") as f:
     for line in f:
         if "=" in line and not line.startswith("#"):
             k, v = line.strip().split("=", 1)

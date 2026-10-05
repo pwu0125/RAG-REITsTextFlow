@@ -2,7 +2,7 @@
 
 > **Fork from** [adennng/RAG-REITsTextFlow](https://github.com/adennng/RAG-REITsTextFlow)  
 > **Maintainer**: [pwu0125](https://github.com/pwu0125)  
-> **Last update**: 2026-06-17
+> **Last update**: 2026-08-15
 
 本项目从原始仓库 fork 而来，在原有 PDF 提取流程基础上进行了**大规模架构重构和工程加固**——新增管道编排器、GATE 质量门控、元数据一致性治理、多级重试与崩溃恢复，使管道从"手动逐步执行"升级为"一键批量自动化运行"。
 
@@ -15,7 +15,7 @@
 | 处理文档总数 | **1,425 份** REITs 公告 PDF |
 | 覆盖 REITs 代码 | **87 个** (全量) |
 | Elasticsearch 入库 | **165 万** text chunks |
-| Milvus 向量库 | **110 万** embedding vectors |
+| FAISS 向量库 | **101 万** embedding vectors（IndexFlatIP, 768 维） |
 | 批次通过率 | **65/87 codes** 全链路闭环 |
 
 ---
@@ -37,14 +37,14 @@
 #### 元数据治理（三位一体体系）
 | 文件 | 功能 | 原因 |
 |------|------|------|
-| `reconcile_meta.py` | **标记对账** — 以 ES/Milvus 物理数据为真相锚点，按 8 条推理链(R0-R8)修正 meta.json 错误标志 | 原仓库重建 manifest 时只看磁盘文件，被 step5 删除的图片骗到，导致"假阴性" |
-| `rebuild_manifest.py` | **manifest 重建** — 从磁盘 meta.json 重建，新增 ES/Milvus 双向交叉校验 | 单向传播导致错误标志扩散 |
+| `reconcile_meta.py` | **标记对账** — 以 ES/FAISS 物理数据为真相锚点，按 8 条推理链(R0-R8)修正 meta.json 错误标志 | 原仓库重建 manifest 时只看磁盘文件，被 step5 删除的图片骗到，导致"假阴性" |
+| `rebuild_manifest.py` | **manifest 重建** — 从磁盘 meta.json 重建，新增 ES/FAISS 双向交叉校验 | 单向传播导致错误标志扩散 |
 | `sync_text_metadata.py` | **标志同步** — text.json metadata → meta.json 同步，防止旧标志覆盖正确值 | step5 merge 时 text.json 可能携带过期 metadata |
 
 #### 诊断与修复工具
 | 文件 | 功能 |
 |------|------|
-| `diagnose_pipeline.py` | 全管道状态诊断（从 ES/Milvus 倒推） |
+| `diagnose_pipeline.py` | 全管道状态诊断（从 ES/FAISS 倒推） |
 | `diagnose_pipeline_state.py` | pipeline_state.json 检查 |
 | `diagnose_full_disk.py` | 磁盘使用量诊断 |
 | `fix_meta_for_recovery.py` | 崩溃恢复标记修复 |
@@ -102,7 +102,7 @@
 ```
 **原因**: macOS 上 pytesseract 抛 OSError 而非 TesseractError，原始 except 未覆盖。
 
-#### step8_1/step8_2 — ES/Milvus 入库增强
+#### step8_1/step8_2 — ES 入库 / FAISS 标志同步增强
 ```diff
 + 批量写入优化
 + 字段完整性校验
@@ -132,7 +132,7 @@
 │  │ Step6 文本分段                                                 ││
 │  │ Step7 向量嵌入                                                 ││
 │  │ Step8.1 ES入库 + GATE2 (≥99.5% accuracy)                      ││
-│  │ Step8.2 Milvus入库                                            ││
+│  │ Step8.2 FAISS标志同步（索引由 build_faiss_index.py 全量重建）  ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                                                                  │
 │  每个步骤支持: checkpoint/resume + 3次瞬时重试(30s/60s/120s)     │
@@ -156,7 +156,7 @@ Layer 2 — sync_text_metadata.py (merge前的最后一公里)
   step5 执行前同步 text.json→meta.json，消除过时标志
   
 Layer 3 — rebuild_manifest.py (双向交叉校验)
-  manifest→ES/Milvus 正向 + ES/Milvus→manifest 反向
+  manifest→ES/FAISS 正向 + ES/FAISS→manifest 反向
 ```
 
 ### 标志位状态推导规则
@@ -165,7 +165,7 @@ Layer 3 — rebuild_manifest.py (双向交叉校验)
 |-----------|---------|--------|
 | step1-5 全部完成 | meta.json 中 merge_done=true **且** GATE1=pass | O(1) |
 | 全链路成功(ES入库) | elasticsearch_database_done=true **且** GATE2=pass | O(1) |
-| 全链路成功(Milvus) | vector_database_done=true | O(1) |
+| 全链路成功(FAISS) | vector_database_done=true | O(1) |
 | step5 之前全部完成 | GATE1=pass（等价推导） | O(1) |
 
 ---
@@ -188,7 +188,7 @@ announcement_document_processing_local/
 
 # 最终检索数据（外部系统）
 ES:  http://localhost:9200/reits_docs       ← 165 万 chunks（全文检索）
-Milvus: http://localhost:19530/reits_embeddings ← 110 万 vectors（语义检索）
+FAISS: ../5_分析结果/faiss_data/reits_faiss.index ← 101 万 vectors（语义检索，本地文件）
 MySQL: announcement.page_data                ← 逐页结构化数据
 ```
 
@@ -205,11 +205,11 @@ MySQL: announcement.page_data                ← 逐页结构化数据
   "text_segmentation": true,        // step6
   "embedding_done": true,           // step7
   "elasticsearch_database_done": true,  // step8.1 + GATE2 pass
-  "vector_database_done": true      // step8.2
+  "vector_database_done": true      // step8.2 (FAISS 标志同步)
 }
 ```
 
-> ⚠️ **信任链方向**: 物理数据(ES/Milvus/磁盘文件) > meta.json。meta.json 是**线索**不是**真相**，可能假阳性或假阴性。判断文档状态时以 ES/Milvus 实际入库数据为准。
+> ⚠️ **信任链方向**: 物理数据(ES/FAISS/磁盘文件) > meta.json。meta.json 是**线索**不是**真相**，可能假阳性或假阴性。判断文档状态时以 ES/FAISS 实际入库数据为准。
 
 ---
 
@@ -219,8 +219,8 @@ MySQL: announcement.page_data                ← 逐页结构化数据
 - Python 3.11+ (conda env: `deepseek-ocr`)
 - MySQL 5.7+
 - Elasticsearch 7.x+
-- Milvus 2.x+
-- Docker (ES + Milvus)
+- faiss-cpu（本地 FAISS 向量索引，替代 Milvus；无需 Milvus 服务）
+- Docker (仅 ES；FAISS 为本地文件，无需容器)
 - 足够的磁盘空间（完整处理 1,425 份 PDF 需 ~300GB）
 
 ### 安装
@@ -243,7 +243,7 @@ cp db_config.example.py db_config.py   # 数据库密码
 
 # 5. 创建数据库索引
 python create_elasticsearch_index.py
-python create_vector_database.py
+python build_faiss_index.py   # 全量重建 FAISS 向量索引（替代已废弃的 create_vector_database.py）
 
 # 6. 下载 TableTransformer 模型
 # (下载到 table-transformer-detection/ 目录，参见 SETUP.md)
@@ -290,7 +290,7 @@ python pipeline_controller.py <batch_name>
 | CC(claude -p) MCP 进程组清理杀子进程 | 管道步骤通过 CC 运行会被 kill | 只能用 conda python 直接运行或 cron job |
 | macOS TesseractNotFoundError 继承 OSError | step3_2 误判 Tesseract 未安装 | ✅ 已修复 |
 | step5 删图后无法追溯中间产物 | 管道断点后无法定位根因 | ✅ GATE1 通过才删图 |
-| meta.json 假阳性/假阴性 | 盲目信任标志位导致误判 | ✅ ES/Milvus 锚定 + reconcile_meta |
+| meta.json 假阳性/假阴性 | 盲目信任标志位导致误判 | ✅ ES/FAISS 锚定 + reconcile_meta |
 | 零图 PDF 不标记 not_table_describe_done | 纯矢量文档卡在 step4→step5 | ✅ 已修复 |
 
 ---

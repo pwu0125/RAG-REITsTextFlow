@@ -5,7 +5,7 @@
 # ============================================================
 set -euo pipefail
 
-V0_DIR="/Users/pyemini/projects/REITs/REITs投研平台V0"
+V0_DIR="/Users/pyemini/REITs/2_公告数据/3_提取管道/RAG-REITsTextFlow"
 CONDA_ENV="deepseek-ocr"
 LOG_DIR="$V0_DIR/log"
 mkdir -p "$LOG_DIR"
@@ -20,6 +20,12 @@ echo "Python: $(which python)"
 echo "============================================"
 
 cd "$V0_DIR"
+
+# --- Step 0: PDF 类型检测 (pdf-inspector 前置路由) ---
+echo ""
+echo ">>> [Step0] PDF 类型检测..."
+python step0_detect_pdf_type.py 2>&1 | tee "$LOG_DIR/step0.log"
+echo ">>> [Step0] 完成 $(date '+%H:%M:%S')"
 
 # --- Step 2: 文本提取 (最耗时) ---
 echo ""
