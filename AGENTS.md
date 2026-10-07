@@ -250,3 +250,30 @@ GLM-5.3-Flash 替代 qwen 视觉线的评估已完成并归档至 `archived/blin
 3. `ocr_router.py` 加进程足迹熔断（top 口径，默认 6G，`LOCAL_OCR_MEM_LIMIT_GB` 可调）超限自动降级 API；另配外部看门狗 `~/.hermes/scripts/ocr_mem_watchdog.sh`（>7G 熔断 KILL，双保险）。
 **运营裁定（2026-10-07 凌晨实测后）**：即使打了补丁，本地 MPS 通道跑真实扫描件仍在页内膨胀（9 分钟 27G、单页未出）。**夜间无人值守批量一律 `STEP2_OCR_BACKEND=api` 强制 API**（符合 2026-09-26「本地仅小活辅助」裁定）；本地通道只允许交互式在场使用。
 **附带发现**：①Docker VM 内存已从 12G 降到 8G（settings-store.json，备份 .bak-20261006）；②CC CLI 通道 403 鉴权失效（api_key_source: payg，上游为 cc-switch 代理 127.0.0.1:15721）待修；③机器 swap 残留 14G 需自然重启归零。待修清单见 `docs/pending_fixes_20261007.md`。
+
+## 🔴 陷阱96（2026-10-07：verify 只做单向对账 → 16 份标志虚高文档漏网）
+
+**现象**：verify_data_integrity.py 全绿（"100% 对齐"），但 16 份文档 ES 实无数据——10 份假空壳（text 在盘、step8 从未成功）+ 6 份真空壳（纯扫描件全链未跑）长期失明。
+**根因**：verify 只查「ES 有 → 标志对不对」（正向）；「标志 True → ES 实有」（反向）是盲区。历史修复对齐标志时按 ES 单向校验通过就置 True，反向缺口永不可见。
+**修复（2026-10-07）**：verify_data_integrity.py 主流程追加反向对账区块——拉全量 ES source_file（composite 聚合，**带 .pdf 后缀**）与 manifest 中 ES=True 键集求差。终验反向 = 0。
+**铁律**：状态对账必须双向。单侧校验通过 ≠ 数据在库。
+
+## 🔴 陷阱97（2026-10-07：ES source_file 键带 .pdf 后缀——核查脚本键口径必须一致）
+
+**现象**：多轮"ES 缺 N 份"审计误报（含 16 份回补的发现过程走了弯路）；早期"7137 差额 0"验收也带毒。
+**根因**：step8_1 写入 ES 的 source_file = manifest 键（带 .pdf）；我的核查脚本用目录名（不带后缀）构造 term 查询 → 永远 0 命中。
+**铁律**：对 ES 做 source_file 精确查询时，键必须带 .pdf 后缀（= manifest 键原样）。凡写"查某文档在不在 ES"的脚本，先跑一份已知在库文档校准键口径。
+
+## 🔴 陷阱98（2026-10-07：step6 偶发 global_id 裸化 → ES _id 碰撞，入库"成功"但查无此文档）
+
+**现象**：508015 明阳 2026 第一次收益分配公告——step8 报"入库成功"，ES 按文档查 0 段。text_segmentation.json 里 8 个 chunk 的 global_id 是裸的 `_1`~`_8`（正常应为 `目录名_N`）。
+**根因**：step6 生成 chunk 时目录名变量为空（具体触发路径待查——这是 RAG 侧未修的代码根因）。global_id 即 ES _id，裸 `_N` 与其它文档碰撞互相覆盖。
+**临时处置**：八标志双写回退 + 坏 segmentation 移出 + 全链重跑（9 段 2112 字正常入库）。
+**待办**：step6 的目录名变量为什么为空要排查；防御层可在 step8_1 入库前校验 global_id 必含目录名前缀，否则拒绝并报警。
+**铁律**：入库脚本必须校验 _id 构造完整性；_id 碰撞是静默数据丢失（后写覆盖先写），不报错。
+
+## 🔴 陷阱99（2026-10-07：rebuild_manifest 会复活已删的判重键——根治需物理移目录）
+
+**现象**：508601 单前缀 05-15 招募书与双前缀 05-15 为同一文档两个目录名（首页逐字相同）。从 manifest 删除后，下一次 rebuild_manifest_v3 又把它加回来（目录在盘即收录）。
+**修复**：判重文档的目录物理移入 `manifest_backups/dup_removed_20261007/`（原始 PDF 仍在 2_原始公告，无数据损失）。
+**铁律**：manifest 删除 ≠ 收录范围变更。要让键永久消失，要么物理移走目录，要么改 is_core_doc/classify_policy 收录规则。

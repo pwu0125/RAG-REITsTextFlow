@@ -230,6 +230,30 @@ def main():
 
     print_report(results)
 
+    # ---- 反向对账（2026-10-07 盲区修复）----
+    # 原校验只查"ES有→标志对"，漏掉"标志True→ES实无"（16份回补事故的漏网点）。
+    # 反向口径: core文档(manifest在册)标志True但ES无该source_file(带.pdf) → 列出。
+    es_files = get_es_source_files() or set()
+    rev_broken = []
+    mf_path = os.path.join(BASE, 'processed_files_local.json')
+    if os.path.exists(mf_path):
+        try:
+            mf = json.load(open(mf_path))
+            for k, v in (mf.get('files') or {}).items():
+                if not isinstance(v, dict):
+                    continue
+                if v.get('elasticsearch_database_done') and k not in es_files:
+                    rev_broken.append(k)
+        except Exception as e:
+            print(f'  ⚠️ 反向对账 manifest 读取失败: {e}')
+    print(f"\n  反向对账(标志True→ES实无): {len(rev_broken)} 份")
+    if rev_broken:
+        print("  ❌ 存在标志虚高文档（需回补或核销）:")
+        for k in rev_broken[:10]:
+            print(f"    {k[:70]}")
+        if len(rev_broken) > 10:
+            print(f"    ... 共 {len(rev_broken)} 份")
+
     if args.fix:
         if results['es_flag_missing'] or results['seg_flag_missing']:
             fix_integrity(results)
