@@ -67,6 +67,38 @@ class OCRRouter:
         )
         self.api_key = dashscope_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
         self._local_backend = None  # 懒加载
+        # 陷阱95防线(2026-10-06): 本地推理内存超限自动降级 API 的阈值
+        self.local_mem_limit_gb = self._rss_limit()
+
+    _MEM_LIMIT_DEFAULT = 6.0  # GB, 环境变量 LOCAL_OCR_MEM_LIMIT_GB 可覆盖
+
+    @classmethod
+    def _rss_limit(cls) -> float:
+        try:
+            return float(os.environ.get("LOCAL_OCR_MEM_LIMIT_GB", cls._MEM_LIMIT_DEFAULT))
+        except ValueError:
+            return cls._MEM_LIMIT_DEFAULT
+
+    @staticmethod
+    def _rss_gb() -> float:
+        """进程内存足迹(GB, top口径含MPS缓存)。psutil缺失时返回0(不降级,保守)。"""
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["top", "-l", "1", "-pid", str(os.getpid()), "-stats", "mem"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            last = [l for l in out.splitlines() if l.strip()][-1]
+            tok = last.split()[0]  # e.g. "27G" / "800M"
+            if tok.endswith("G"):
+                return float(tok[:-1])
+            if tok.endswith("M"):
+                return float(tok[:-1]) / 1024
+            if tok.endswith("K"):
+                return float(tok[:-1]) / (1024 * 1024)
+            return 0.0
+        except Exception:
+            return 0.0
 
     # ── 公共接口 ──────────────────────────────────
 
@@ -95,6 +127,13 @@ class OCRRouter:
             if not os.path.isdir(self.model_path):
                 logger.warning(
                     f"[LocalOCR] 本地模型缺失: {self.model_path} → 降级 API"
+                )
+                return self._ocr_api(image_path, prompt)
+            # 陷阱95防线(2026-10-06): 进程内存超限 → 剩余页降级 API, 不硬扛本地
+            if self._rss_gb() > self.local_mem_limit_gb:
+                logger.warning(
+                    f"[LocalOCR] 进程内存 {self._rss_gb():.1f}G 超限 "
+                    f"{self.local_mem_limit_gb}G → 本页降级 API"
                 )
                 return self._ocr_api(image_path, prompt)
             return self._ocr_local(image_path, prompt)

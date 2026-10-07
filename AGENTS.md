@@ -237,3 +237,16 @@ RAG-REITsTextFlow/
 ## 🗄️ B线归档（2026-10-05 用户裁定：维持A线）
 
 GLM-5.3-Flash 替代 qwen 视觉线的评估已完成并归档至 `archived/bline_glm_20261005/`（含A/B测试数据、结论README）。要点：数字质量基本达标(Jaccard 0.965)但偶发缩水(同图5测2次漏整张收入表)+跨页合并图(占24%)连续空返回+API直连夜间五折不免费(全量约1.23万分)。A线继续为唯一表格描述通道。复活条件见归档README。
+
+## 🔴 陷阱95（2026-10-06：step2 本地 OCR 内存膨胀引发内核 panic；本地通道对扫描件不可用）
+
+**现象**：RAG 补入库夜间运行 step2 时机器整机卡死 94 秒 → watchdog 内核 panic 强制重启（21:44，panic 报告 `panic-full-2026-10-06-214442`，压缩器 100% + 68 个 swapfile）。之后实测：worker 处理 508021 概要类扫描件时 phys_footprint 10 分钟 30G→38G 单调上涨；另一 worker 起步 2 分钟即 21G。
+**根因（两层叠加）**：
+1. DeepSeek-OCR-2 的 MPS 推理在**单页 generate 内部**即持续膨胀（max_new_tokens=8192 + use_cache=True，页后 empty_cache 救不了页内失控；10-05 陷阱94修复加入的 OCR 路由首次让本地通道吃到真实扫描页流量）；
+2. ProcessPoolExecutor worker 常驻 → 6.3G 模型 ×3 worker + MPS 缓存累积不归还系统；叠加 Docker VM 当时 12G 锁定，把 24G 机器直接压死。
+**修复（2026-10-06/07，三道防线）**：
+1. `mps_backend.py::infer` finally 中 `gc.collect() + torch.mps.synchronize() + torch.mps.empty_cache()`（页后回收）；
+2. `step2` 的 Pool 加 `max_tasks_per_child=1`（每 worker 处理 1 个 PDF 即退出，模型随之释放）；
+3. `ocr_router.py` 加进程足迹熔断（top 口径，默认 6G，`LOCAL_OCR_MEM_LIMIT_GB` 可调）超限自动降级 API；另配外部看门狗 `~/.hermes/scripts/ocr_mem_watchdog.sh`（>7G 熔断 KILL，双保险）。
+**运营裁定（2026-10-07 凌晨实测后）**：即使打了补丁，本地 MPS 通道跑真实扫描件仍在页内膨胀（9 分钟 27G、单页未出）。**夜间无人值守批量一律 `STEP2_OCR_BACKEND=api` 强制 API**（符合 2026-09-26「本地仅小活辅助」裁定）；本地通道只允许交互式在场使用。
+**附带发现**：①Docker VM 内存已从 12G 降到 8G（settings-store.json，备份 .bak-20261006）；②CC CLI 通道 403 鉴权失效（api_key_source: payg，上游为 cc-switch 代理 127.0.0.1:15721）待修；③机器 swap 残留 14G 需自然重启归零。待修清单见 `docs/pending_fixes_20261007.md`。

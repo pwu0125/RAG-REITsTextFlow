@@ -239,12 +239,31 @@ def process_single_image(img_file, table_img_dir, pdf_info, describe_json_path, 
                 image_path = compressed
     except Exception:
         pass
+    # ═══ Fix 7: 空白页防线(2026-10-07用户批准) ═══
+    # 纯白图(非白像素<0.5%)→qwen-vl恒返回空→重试全空→整份文档误判失败(黑名单误杀)。
+    # 空白页无内容是事实,写占位描述算成功,不走API。降采样统计防内存膨胀(陷阱95教训)。
+    _skip_api = False
     try:
+        from PIL import Image as _PILImage
+        import numpy as _np
+        with _PILImage.open(image_path) as _im:
+            _gray = _im.convert("L")
+            if max(_gray.size) > 500:
+                _ratio = 500 / max(_gray.size)
+                _gray = _gray.resize((max(1, int(_gray.width * _ratio)), max(1, int(_gray.height * _ratio))))
+            if float((_np.asarray(_gray) < 200).mean()) < 0.005:
+                print(f"图片 {img_file} 判定为空白页(非白像素<0.5%),写占位描述,跳过API。")
+                description = "本页为空白页,无表格内容。"
+                _skip_api = True
+    except Exception:
+        _skip_api = False  # 检测失败保守走原路径
+    if not _skip_api:
+      try:
         start_time = time.time()
         description = generate_table_description(image_path)
         elapsed_time = time.time() - start_time
         print(f"图片 {img_file} 生成描述耗时 {elapsed_time:.2f} 秒。")
-    except Exception as e:
+      except Exception as e:
         # ═══ Fix 3: transient error retry with backoff ═══
         transient_types = (BrokenPipeError, TimeoutError, ConnectionError,
                           ConnectionResetError, OSError)

@@ -596,6 +596,29 @@ def process_single_file(args):
                     # 当作扫描页：包括文字提取不足或乱码情况
                     print(f"[矢量提取不足或乱码] 第 {page_number} 页, 长度 {len(vector_text)}, 汉字数 {han_count}")
                     convert_scanned_page_to_image(pdf_path, page_number, 300, temp_img_dir)
+                    # ── Fix 8: 无pdf_type路由的存量扫描件兜底(2026-10-07) ──
+                    # 旧逻辑只渲染不提取 → 陷阱91防线拒绝置位 → 文档永久滞留黑名单。
+                    # 渲染完立即走 OCR 路由(与上方 direct_render_pages 分支同款)。
+                    _img_path = os.path.join(temp_img_dir, f"page_{page_number}.png")
+                    if os.path.exists(_img_path):
+                        _ocr_text = _ocr_rendered_page(_img_path, pdf_folder_dir, total_pages)
+                        if _ocr_text and _ocr_text.strip():
+                            page_metadata = file_info.copy()
+                            page_metadata.update({
+                                "source_file": file_info["file_name"],
+                                "page_num": page_number
+                            })
+                            file_pages_dict[str(page_number)] = {
+                                "text": _ocr_text.strip(),
+                                "metadata": page_metadata,
+                            }
+                            final_data = {"pages": file_pages_dict, "metadata": file_info}
+                            with open(output_json_file, 'w', encoding='utf-8') as f:
+                                json.dump(final_data, f, ensure_ascii=False, indent=4, cls=DateTimeEncoder)
+                            print(f"[页面保存-兜底OCR] 第 {page_number} 页 OCR文本 {len(_ocr_text)} 字符 -> text.json")
+                        else:
+                            print(f"[OCR空返回] 第 {page_number} 页兜底OCR 未取到文本, 仅保留渲染图")
+                    continue
 
     except Exception as e:
         print(f"[错误] 文件 {pdf_path} 处理失败: {e}")
@@ -672,7 +695,10 @@ def main():
     success_count = 0
     fail_list = []
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+    # 陷阱95修复(2026-10-06): OCR路由开启后worker常驻加载DeepSeek-OCR-2(6.3G/份),
+    # MPS缓存跨页累积引发内核panic。max_tasks_per_child=1: 每worker处理1个PDF即回收,
+    # 模型与缓存随之释放,单worker足迹从38G+回落至基线。3.11+原生支持。
+    with concurrent.futures.ProcessPoolExecutor(max_workers=3, max_tasks_per_child=1) as executor:
         future_map = {executor.submit(process_single_file, t): t for t in tasks}
         for future in concurrent.futures.as_completed(future_map):
             file_info, _ = future_map[future]
