@@ -233,8 +233,16 @@ def bulk_insert_es(source_file, docs):
     if not docs:
         raise ValueError("无文档可插入ES")
     actions = []
+    rejected = 0
     for doc in docs:
         _id = doc["global_id"] if "global_id" in doc and doc["global_id"] else doc["id"]
+        # 陷阱98防御: _id 必须是 "<目录名>_<chunk序号>" 形态; 裸 "_N"/纯数字与其它文档碰撞
+        _id_str = str(_id)
+        if not (_id_str.endswith(tuple(f"_{i}" for i in range(1, 10001))) and len(_id_str) > 8):
+            print(f"  ⚠️ [陷阱98防御] 可疑 _id 形态: '{_id_str[:50]}' "
+                  f"(doc={doc.get('source_file', '?')[:40]}) — 拒绝入库", flush=True)
+            rejected += 1
+            continue
         action = {
             "_index": INDEX_NAME,
             "_id": _id,

@@ -435,7 +435,13 @@ def process_pdf_segmentation(pdf_folder):
         combined_meta["char_count"] = char_cnt
         source_file = combined_meta.get("source_file", "")
         base_name = os.path.splitext(source_file)[0] if source_file else ""
-        global_id = f"{base_name}_{idx}" if base_name else f"_{idx}"
+        # 陷阱98防御: source_file缺失时禁止生成裸 _id (会与其它文档碰撞互相覆盖)
+        if not base_name:
+            raise ValueError(
+                f"[陷阱98防御] chunk {idx}: source_file 为空, 拒绝生成裸 global_id. "
+                f"上游 text.json.metadata 缺 source_file — 先修复 metadata 再切分."
+            )
+        global_id = f"{base_name}_{idx}"
         final_chunks.append({
             "chunk_id": idx,
             "global_id": global_id,
